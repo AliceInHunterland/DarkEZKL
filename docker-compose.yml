@@ -1,0 +1,81 @@
+services:
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1 # or "all"
+              capabilities: [gpu]
+
+    # Ensure relative paths (e.g. benchmark.py) resolve consistently
+    working_dir: /app
+
+    # Fixes for PyTorch/CUDA shared memory and stack limits
+    # "ipc: host" allows the container to use the host's shared memory, preventing OOM (exit code 137)
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+    environment:
+      - ENABLE_ICICLE_GPU=true
+      # Force icicle to engage even for small-ish circuits (ezkl disables icicle for k<=8 by default).
+      # Setting to 0 means "treat no circuit as 'small'".
+      - ICICLE_SMALL_K=0
+
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - TORCH_HOME=/app/.cache/torch
+      - XDG_CACHE_HOME=/app/.cache
+      - HF_HOME=/app/.cache/huggingface
+      - HF_HUB_DISABLE_TELEMETRY=1
+
+      # Prefer fp16 ONNX for smaller circuits + faster witness gen.
+      # Options: fp16 | fp32 | int8 (int8 is best-effort; fp16 is recommended)
+      - EZKL_ONNX_PRECISION=fp16
+
+      # Performance profiling: enable unsafe check mode (lower guarantees, faster)
+      - EZKL_CHECK_MODE=unsafe
+      - EZKL_LOOKUP_SAFETY_MARGIN=1.02
+
+      # Better crash diagnostics + less memory fragmentation
+      - PYTHONFAULTHANDLER=1
+      - MALLOC_ARENA_MAX=2
+
+      # Logging
+      - LOG_LEVEL=INFO
+
+      # Runs each model in its own subprocess so a single OOM kill (exit 137)
+      # doesn't take down the whole benchmark container.
+      - ISOLATE_MODELS=true
+      - MODEL_PROCESS_TAIL_LINES=250
+
+      # Enable ONNX splitting for big models by default (can be overridden by CLI flags)
+      - SPLIT_ONNX=true
+      - SPLIT_MIN_PARAMS_M=0.05
+
+    volumes:
+      - ./:/app/
+
+    # Run the fixed probabilistic benchmark suite (enforced by benchmark.py):
+    #   models: vit,lenet-5-small,repvgg-a0
+    #   prob_k_values: 2,4
+    #   runs: 3
+    command:
+      [
+        "python3",
+        "/app/benchmark.py",
+        "--outdir",
+        "/app/results",
+        "--models",
+        "vit,lenet-5-small,repvgg-a0",
+        "--prob-k-values",
+        "4,8,16",
+        "--runs",
+        "7"
+      ]
