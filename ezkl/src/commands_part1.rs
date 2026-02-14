@@ -1,25 +1,17 @@
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::str::FromStr;
-
-#[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
-use tosubcommand::ToSubcommand;
-#[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
-use tosubcommand::ToFlags;
 
 use crate::{
     circuit::{table::Range, CheckMode},
     fieldutils::IntegerRep,
     graph::Visibility,
-    CalibrationTarget, ContractType, H160Flag, Scale, DEFAULT_CALIBRATION_FILE,
-    DEFAULT_CALIBRATION_TARGET, DEFAULT_CALLDATA, DEFAULT_CHECKMODE, DEFAULT_COMPILED_CIRCUIT,
-    DEFAULT_CONTRACT_ADDRESS, DEFAULT_CONTRACT_DEPLOYMENT_TYPE, DEFAULT_DATA,
-    DEFAULT_DECIMALS, DEFAULT_DISABLE_SELECTOR_COMPRESSION, DEFAULT_LOOKUP_SAFETY_MARGIN,
-    DEFAULT_MODEL, DEFAULT_OPTIMIZER_RUNS, DEFAULT_PK, DEFAULT_PROOF, DEFAULT_RENDER_REUSABLE,
-    DEFAULT_SCALE_REBASE_MULTIPLIERS, DEFAULT_SEED, DEFAULT_SETTINGS, DEFAULT_SOL_CODE,
-    DEFAULT_USE_REDUCED_SRS_FOR_VERIFICATION, DEFAULT_VERIFIER_ABI, DEFAULT_VK, DEFAULT_VKA,
-    DEFAULT_VKA_DIGEST, DEFAULT_WITNESS,
+    CalibrationTarget, Scale, DEFAULT_CALIBRATION_FILE,
+    DEFAULT_CALIBRATION_TARGET, DEFAULT_CHECKMODE, DEFAULT_COMPILED_CIRCUIT, DEFAULT_DATA, DEFAULT_DISABLE_SELECTOR_COMPRESSION, DEFAULT_LOOKUP_SAFETY_MARGIN,
+    DEFAULT_MODEL, DEFAULT_PK, DEFAULT_PROOF,
+    DEFAULT_SCALE_REBASE_MULTIPLIERS, DEFAULT_SEED, DEFAULT_SETTINGS,
+    DEFAULT_USE_REDUCED_SRS_FOR_VERIFICATION, DEFAULT_VK, DEFAULT_WITNESS,
 };
 #[cfg(feature = "python-bindings")]
 use pyo3::{conversion::FromPyObject, exceptions::PyValueError, prelude::*, IntoPyObject};
@@ -48,13 +40,6 @@ impl FromStr for DataField {
     }
 }
 
-#[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
-impl ToFlags for DataField {
-    fn to_flags(&self) -> Vec<String> {
-        vec![self.0.clone()]
-    }
-}
-
 impl std::fmt::Display for DataField {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -62,7 +47,7 @@ impl std::fmt::Display for DataField {
 }
 
 #[allow(missing_docs)]
-#[derive(Debug, Subcommand, Clone, Deserialize, Serialize, PartialEq, PartialOrd, ToSubcommand)]
+#[derive(Debug, Subcommand, Clone, Deserialize, Serialize, PartialEq)]
 pub enum Commands {
     #[cfg(feature = "empty-cmd")]
     /// Creates an empty buffer
@@ -129,6 +114,7 @@ pub enum Commands {
         /// The path to generate the circuit settings .json file to
         #[arg(
             short = 'O',
+            short_alias = 'S',
             long,
             default_value = DEFAULT_SETTINGS,
             value_hint = clap::ValueHint::FilePath
@@ -195,6 +181,7 @@ pub enum Commands {
         /// The path to load circuit settings .json file AND overwrite (generated using the gen-settings command).
         #[arg(
             short = 'O',
+            short_alias = 'S',
             long,
             default_value = DEFAULT_SETTINGS,
             value_hint = clap::ValueHint::FilePath
@@ -369,89 +356,6 @@ pub enum Commands {
         #[arg(long, default_value = DEFAULT_CHECKMODE, value_hint = clap::ValueHint::Other)]
         check_mode: Option<CheckMode>,
     },
-    /// Encodes a proof into evm calldata
-    #[command(name = "encode-evm-calldata")]
-    #[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-    EncodeEvmCalldata {
-        /// The path to the proof file (generated using the prove command)
-        #[arg(long, default_value = DEFAULT_PROOF, value_hint = clap::ValueHint::FilePath)]
-        proof_path: Option<PathBuf>,
-        /// The path to save the calldata to
-        #[arg(long, default_value = DEFAULT_CALLDATA, value_hint = clap::ValueHint::FilePath)]
-        calldata_path: Option<PathBuf>,
-        /// The path to the serialized VKA file
-        #[cfg_attr(
-            all(feature = "reusable-verifier", not(target_arch = "wasm32")),
-            arg(long, value_hint = clap::ValueHint::Other)
-        )]
-        vka_path: Option<PathBuf>,
-    },
-    /// Creates an Evm verifier for a single proof
-    #[command(name = "create-evm-verifier")]
-    #[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-    CreateEvmVerifier {
-        /// The path to SRS, if None will use ~/.ezkl/srs/kzg{logrows}.srs
-        #[arg(long, value_hint = clap::ValueHint::FilePath)]
-        srs_path: Option<PathBuf>,
-        /// The path to load circuit settings .json file from (generated using the gen-settings command)
-        #[arg(
-            short = 'S',
-            long,
-            default_value = DEFAULT_SETTINGS,
-            value_hint = clap::ValueHint::FilePath
-        )]
-        settings_path: Option<PathBuf>,
-        /// The path to load the desired verification key file
-        #[arg(long, default_value = DEFAULT_VK, value_hint = clap::ValueHint::FilePath)]
-        vk_path: Option<PathBuf>,
-        /// The path to output the Solidity code
-        #[arg(long, default_value = DEFAULT_SOL_CODE, value_hint = clap::ValueHint::FilePath)]
-        sol_code_path: Option<PathBuf>,
-        /// The path to output the Solidity verifier ABI
-        #[arg(long, default_value = DEFAULT_VERIFIER_ABI, value_hint = clap::ValueHint::FilePath)]
-        abi_path: Option<PathBuf>,
-        /// Whether to render the verifier as reusable or not. If true, you will need to deploy a VK artifact, passing it as part of the calldata to the verifier.
-        #[cfg_attr(
-            all(feature = "reusable-verifier", not(target_arch = "wasm32")),
-            arg(
-                short = 'R',
-                long,
-                default_value = DEFAULT_RENDER_REUSABLE,
-                action = clap::ArgAction::SetTrue
-            )
-        )]
-        reusable: Option<bool>,
-    },
-    /// Creates an evm verifier artifact to be used by the reusable verifier
-    #[command(name = "create-evm-vka")]
-    #[cfg(all(
-        feature = "eth",
-        feature = "reusable-verifier",
-        not(target_arch = "wasm32")
-    ))]
-    CreateEvmVka {
-        /// The path to SRS, if None will use ~/.ezkl/srs/kzg{logrows}.srs
-        #[arg(long, value_hint = clap::ValueHint::FilePath)]
-        srs_path: Option<PathBuf>,
-        /// The path to load circuit settings .json file from (generated using the gen-settings command)
-        #[arg(
-            short = 'S',
-            long,
-            default_value = DEFAULT_SETTINGS,
-            value_hint = clap::ValueHint::FilePath
-        )]
-        settings_path: Option<PathBuf>,
-        /// The path to load the desired verification key file
-        #[arg(long, default_value = DEFAULT_VK, value_hint = clap::ValueHint::FilePath)]
-        vk_path: Option<PathBuf>,
-        /// The path to output the vka calldata
-        #[arg(long, default_value = DEFAULT_VKA, value_hint = clap::ValueHint::FilePath)]
-        vka_path: Option<PathBuf>,
-        /// The number of decimals we want to use for the rescaling of the instances into on-chain floats
-        /// Default is 18, which is the number of decimals used by most ERC20 tokens
-        #[arg(long, default_value = DEFAULT_DECIMALS, value_hint = clap::ValueHint::Other)]
-        decimals: Option<usize>,
-    },
 
     /// Verifies a proof, returning accept or reject
     Verify {
@@ -481,94 +385,6 @@ pub enum Commands {
         reduced_srs: Option<bool>,
     },
 
-    /// Deploys an evm contract (verifier, reusable verifier, or vk artifact) that is generated by ezkl
-    #[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-    DeployEvm {
-        /// The path to the Solidity code (generated using the create-evm-verifier command)
-        #[arg(long, default_value = DEFAULT_SOL_CODE, value_hint = clap::ValueHint::FilePath)]
-        sol_code_path: Option<PathBuf>,
-        /// RPC URL for an Ethereum node
-        #[arg(
-            short = 'U',
-            long,
-            default_value = DEFAULT_CONTRACT_ADDRESS,
-            value_hint = clap::ValueHint::Url
-        )]
-        rpc_url: String,
-        #[arg(long, default_value = DEFAULT_CONTRACT_ADDRESS, value_hint = clap::ValueHint::Other)]
-        /// The path to output the contract address
-        addr_path: Option<PathBuf>,
-        /// The optimizer runs to set on the verifier. Lower values optimize for deployment cost, while higher values optimize for gas cost.
-        #[arg(long, default_value = DEFAULT_OPTIMIZER_RUNS, value_hint = clap::ValueHint::Other)]
-        optimizer_runs: usize,
-        /// Private secp256K1 key in hex format, 64 chars, no 0x prefix, of the account signing transactions. If None the private key will be generated by Anvil
-        #[arg(short = 'P', long, value_hint = clap::ValueHint::Other)]
-        private_key: Option<String>,
-        /// Contract type to be deployed
-        #[cfg(all(feature = "reusable-verifier", not(target_arch = "wasm32")))]
-        #[arg(
-            long = "contract-type",
-            short = 'C',
-            default_value = DEFAULT_CONTRACT_DEPLOYMENT_TYPE,
-            value_hint = clap::ValueHint::Other
-        )]
-        contract: ContractType,
-    },
-    /// Verifies a proof using a local Evm executor, returning accept or reject
-    #[command(name = "verify-evm")]
-    #[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-    VerifyEvm {
-        /// The path to the proof file (generated using the prove command)
-        #[arg(long, default_value = DEFAULT_PROOF, value_hint = clap::ValueHint::FilePath)]
-        proof_path: Option<PathBuf>,
-        /// The path to verifier contract's address
-        #[arg(
-            long,
-            default_value = DEFAULT_CONTRACT_ADDRESS,
-            value_hint = clap::ValueHint::Other
-        )]
-        addr_verifier: H160Flag,
-        /// RPC URL for an Ethereum node
-        #[arg(short = 'U', long, value_hint = clap::ValueHint::Url)]
-        rpc_url: String,
-        /// The path to the serialized vka file
-        #[cfg_attr(
-            all(feature = "reusable-verifier", not(target_arch = "wasm32")),
-            arg(long, value_hint = clap::ValueHint::FilePath)
-        )]
-        vka_path: Option<PathBuf>,
-        /// The path to the serialized encoded calldata file generated via the encode_calldata command
-        #[arg(long, value_hint = clap::ValueHint::FilePath)]
-        encoded_calldata: Option<PathBuf>,
-    },
-    /// Registers a VKA, returning the its digest used to identify it on-chain.
-    #[command(name = "register-vka")]
-    #[cfg(feature = "reusable-verifier")]
-    RegisterVka {
-        /// RPC URL for an Ethereum node, if None will use Anvil but WON'T persist state
-        #[arg(short = 'U', long, value_hint = clap::ValueHint::Url)]
-        rpc_url: String,
-        /// The path to the reusable verifier contract's address
-        #[arg(
-            long,
-            default_value = DEFAULT_CONTRACT_ADDRESS,
-            value_hint = clap::ValueHint::Other
-        )]
-        addr_verifier: H160Flag,
-        /// The path to the serialized VKA file
-        #[arg(long, default_value = DEFAULT_VKA, value_hint = clap::ValueHint::FilePath)]
-        vka_path: Option<PathBuf>,
-        /// The path to output the VKA digest to
-        #[arg(
-            long,
-            default_value = DEFAULT_VKA_DIGEST,
-            value_hint = clap::ValueHint::FilePath
-        )]
-        vka_digest_path: Option<PathBuf>,
-        /// Private secp256K1 key in hex format, 64 chars, no 0x prefix, of the account signing transactions. If None the private key will be generated by Anvil
-        #[arg(short = 'P', long, value_hint = clap::ValueHint::Other)]
-        private_key: Option<String>,
-    },
     #[cfg(not(feature = "no-update"))]
     /// Updates ezkl binary to version specified (or latest if not specified)
     Update {

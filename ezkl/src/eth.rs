@@ -23,6 +23,7 @@ use alloy::transports::{RpcError, TransportErrorKind};
 use foundry_compilers::artifacts::Settings as SolcSettings;
 use foundry_compilers::error::{SolcError, SolcIoError};
 use foundry_compilers::Solc;
+#[cfg(feature = "halo2_solidity_verifier")]
 use halo2_solidity_verifier::encode_register_vk_calldata;
 use halo2curves::bn256::{Fr, G1Affine};
 use log::{debug, info, warn};
@@ -147,7 +148,7 @@ pub async fn setup_eth_backend(
             .on_http(endpoint.parse().map_err(|_| EthError::UrlParse(endpoint))?),
     );
 
-    let chain_id = client.get_chain_id().await?;
+    let chain_id = client.as_ref().get_chain_id().await?;
     info!("using chain {}", chain_id);
 
     Ok((client, wallet_address))
@@ -174,6 +175,7 @@ pub async fn deploy_contract_via_solidity(
 }
 
 ///
+#[cfg(feature = "halo2_solidity_verifier")]
 pub async fn register_vka_via_rv(
     rpc_url: &str,
     private_key: Option<&str>,
@@ -204,13 +206,13 @@ pub async fn register_vka_via_rv(
     // decode return bytes value into uint8
     let output = result.to_vec();
 
-    let gas = client.estimate_gas(&tx).await?;
+    let gas = client.as_ref().estimate_gas(&tx).await?;
 
     info!("estimated vka registration cost: {:#?}", gas);
 
     // broadcast the transaction
 
-    let result = client.send_transaction(tx).await?;
+    let result = client.as_ref().send_transaction(tx).await?;
 
     result.watch().await?;
 
@@ -308,7 +310,7 @@ pub async fn verify_proof_via_solidity(
         return Err(EthError::EvmVerificationError("Invalid proof".into()));
     }
 
-    let gas = client.estimate_gas(&tx).await?;
+    let gas = client.as_ref().estimate_gas(&tx).await?;
 
     info!("estimated verify gas cost: {:#?}", gas);
 
@@ -327,13 +329,13 @@ pub async fn verify_proof_via_solidity(
 }
 
 /// Generates the contract factory for a solidity verifier. The factory is used to deploy the contract
-fn get_sol_contract_factory<'a, M: 'static + Provider<Http<Client>, Ethereum>, T: TokenSeq<'a>>(
+fn get_sol_contract_factory<'a, T: TokenSeq<'a>>(
     abi: JsonAbi,
     bytecode: Bytes,
     runtime_bytecode: Bytes,
-    client: Arc<M>,
+    client: EthersClient,
     params: Option<T>,
-) -> Result<ContractFactory<M>, EthError> {
+) -> Result<CallBuilder<Http<Client>, EthersClient, ()>, EthError> {
     const MAX_RUNTIME_BYTECODE_SIZE: usize = 24577;
     let size = runtime_bytecode.len();
     debug!("runtime bytecode size: {:#?}", size);

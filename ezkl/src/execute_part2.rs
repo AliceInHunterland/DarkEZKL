@@ -1,12 +1,5 @@
-// NOTE: `colored_json` is an optional dependency (enabled via the `colored_json` feature).
-// This file must compile even when that feature is disabled (e.g. `--no-default-features`),
-// so the import and all usages must be cfg-gated.
 #[cfg(all(feature = "colored_json", not(target_arch = "wasm32")))]
 use colored_json::prelude::ToColoredJson;
-
-// Needed for `.cartesian_product()`, `.sorted()`, `.dedup()`, `.collect_vec()`, etc.
-use itertools::Itertools;
-
 #[derive(Debug, Clone)]
 #[cfg_attr(
     all(feature = "tabled", not(target_arch = "wasm32")),
@@ -71,11 +64,9 @@ impl AccuracyResults {
             || percentage_errors.is_empty()
             || abs_percentage_errors.is_empty()
         {
-            return Err(
-                "cannot compute accuracy: empty predictions (no elements after flattening)"
-                    .to_string()
-                    .into(),
-            );
+            return Err(EZKLError::msg(
+                "cannot compute accuracy: empty predictions (no elements after flattening)",
+            ));
         }
 
         // Sort for proper median computation.
@@ -176,11 +167,27 @@ pub(crate) fn calibrate(
         model.graph.input_shapes()?,
     )?;
 
-    let range = if let Some(scales) = scales {
+    // Default scale search band:
+    // - If the caller passes `--scales`, we only try those.
+    // - Otherwise:
+    //   * Always include the scales already present in settings.json (common in benchmarks).
+    //   * For `--target accuracy`, also include the historic (11..14) window.
+    //   * For `--target resources`, do NOT expand the search window unless scales appear "unset" (0,0),
+    //     to avoid an O(|range|^2) blow-up on large models.
+    let mut range: Vec<crate::Scale> = if let Some(scales) = scales {
         scales
     } else {
-        (11..14).collect::<Vec<crate::Scale>>()
+        let mut r = vec![settings.run_args.input_scale, settings.run_args.param_scale];
+
+        let scales_unset = settings.run_args.input_scale == 0 && settings.run_args.param_scale == 0;
+        if matches!(target, CalibrationTarget::Accuracy) || scales_unset {
+            r.extend(11..14);
+        }
+
+        r
     };
+    range.sort();
+    range.dedup();
 
     let mut found_params: Vec<GraphSettings> = vec![];
 
@@ -219,18 +226,72 @@ pub(crate) fn calibrate(
         .map(|(a, b)| (*a, *b))
         .collect::<Vec<((crate::Scale, crate::Scale), u32)>>();
 
+    let total_cases = range_grid.len();
+
+    eprintln!(
+        "[calibrate-settings] target={}, calibration_batches={}, scale_pairs_to_try={}. \
+         Hint: pass --scales <csv> to restrict scale search (faster on large models).",
+        target,
+        chunks.len(),
+        total_cases
+    );
+
     let mut forward_pass_res = HashMap::new();
 
-    let pb = init_bar(range_grid.len() as u64);
+    let pb = init_bar(total_cases as u64);
     pb.set_message("calibrating...");
 
     let mut num_failed = 0;
     let mut num_passed = 0;
     let mut failure_reasons = vec![];
 
-    for ((input_scale, param_scale), scale_rebase_multiplier) in range_grid {
-        // NOTE: avoid `colored` dependency methods (e.g. `.blue()`, `.red()`) here so this
-        // code can compile in builds that don't enable optional coloring/logging features.
+    // If decomposition is too small (base^legs), calibration can fail at layout time with:
+    //   "[tensor] decomposition error: integer X is too large to be represented by base 128 and n <legs>"
+    //
+    // During calibration we can safely auto-increase `decomp_legs` (it only affects proving resources)
+    // until the forward pass succeeds.
+    const AUTO_DECOMP_LEGS_MAX: usize = 8;
+    let is_decomp_overflow = |s: &str| -> bool {
+        s.contains("decomposition error") && s.contains("too large to be represented")
+    };
+
+    // If `calc_min_logrows` fails with `ExtendedKTooLarge`, the circuit is too "tall" (too many rows)
+    // to fit within the max allowed k (typically 26 on BN254 when accounting for quotient polynomial
+    // degree). A pragmatic way to reduce required rows is to widen the layout by increasing
+    // `num_inner_cols` (more parallelism across columns).
+    //
+    // We keep this bounded to avoid accidentally allocating an extreme number of advice columns.
+    const AUTO_NUM_INNER_COLS_MAX_DEFAULT: usize = 64;
+    let auto_num_inner_cols_max: usize = std::env::var("EZKL_AUTO_NUM_INNER_COLS_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(AUTO_NUM_INNER_COLS_MAX_DEFAULT)
+        .max(1);
+
+    // This matches the effective cap enforced inside `GraphCircuit::calc_min_logrows`
+    // (MAX_PUBLIC_SRS min user max_logrows).
+    let effective_max_k: u32 = max_logrows
+        .unwrap_or(crate::graph::MAX_PUBLIC_SRS)
+        .min(crate::graph::MAX_PUBLIC_SRS);
+
+    for (case_idx, ((input_scale, param_scale), scale_rebase_multiplier)) in
+        range_grid.into_iter().enumerate()
+    {
+        let case_no = case_idx + 1;
+
+        // One line per case so users can see progress even if stdout is captured.
+        eprintln!(
+            "[calibrate-settings] case {}/{}: input_scale={}, param_scale={}, rebase_multiplier={}, decomp_base={}, decomp_legs={}, num_inner_cols={}",
+            case_no,
+            total_cases,
+            input_scale,
+            param_scale,
+            scale_rebase_multiplier,
+            settings.run_args.decomp_base,
+            settings.run_args.decomp_legs,
+            settings.run_args.num_inner_cols
+        );
+
         pb.set_message(format!(
             "i-scale: {}, p-scale: {}, rebase-(x): {}, fail: {}, pass: {}",
             input_scale.to_string(),
@@ -243,7 +304,7 @@ pub(crate) fn calibrate(
         let key = (input_scale, param_scale, scale_rebase_multiplier);
         forward_pass_res.insert(key, vec![]);
 
-        let local_run_args = RunArgs {
+        let mut local_run_args = RunArgs {
             input_scale,
             param_scale,
             scale_rebase_multiplier,
@@ -251,85 +312,176 @@ pub(crate) fn calibrate(
             ..settings.run_args.clone()
         };
 
-        // if unix get a gag
-        #[cfg(all(not(not(feature = "ezkl")), unix))]
-        let _r = gag::Gag::stdout().ok();
-        #[cfg(all(not(not(feature = "ezkl")), unix))]
-        let _g = gag::Gag::stderr().ok();
+        // Keep stdout clean (the CLI prints a JSON blob on stdout for machine parsing).
+        // Set `EZKL_GAG_STDOUT=0` if you want to see stdout from underlying libraries.
+        #[cfg(unix)]
+        let _stdout_gag: Option<gag::Gag> = {
+            let raw = std::env::var("EZKL_GAG_STDOUT").unwrap_or_else(|_| "1".to_string());
+            let raw_lc = raw.trim().to_lowercase();
+            let enabled = !matches!(raw_lc.as_str(), "0" | "false" | "no");
+            if enabled {
+                gag::Gag::stdout().ok()
+            } else {
+                None
+            }
+        };
 
-        let mut circuit = match GraphCircuit::from_run_args(&local_run_args, &model_path) {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("circuit creation from run args failed: {:?}", e);
+        // Try a forward pass. If we hit a decomposition overflow, retry with more `decomp_legs`.
+        let start_legs = local_run_args.decomp_legs;
+        let max_legs = std::cmp::max(start_legs, AUTO_DECOMP_LEGS_MAX);
+
+        let mut circuit: Option<GraphCircuit> = None;
+        let mut candidate_err: Option<String> = None;
+
+        for legs in start_legs..=max_legs {
+            local_run_args.decomp_legs = legs;
+
+            // Reset results for this key in case we're retrying.
+            if let Some(v) = forward_pass_res.get_mut(&key) {
+                v.clear();
+            }
+
+            let mut attempt_circuit = match GraphCircuit::from_run_args(&local_run_args, &model_path)
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = format!("circuit creation from run args failed: {}", e);
+
+                    if is_decomp_overflow(&msg) && legs < max_legs {
+                        eprintln!(
+                            "[calibrate-settings] case {}/{}: decomposition overflow at decomp_legs={} during circuit creation; retrying with decomp_legs={}",
+                            case_no,
+                            total_cases,
+                            legs,
+                            legs + 1
+                        );
+                        continue;
+                    }
+
+                    candidate_err = Some(msg);
+                    break;
+                }
+            };
+
+            // Forward pass through all calibration batches.
+            let fwd_start = Instant::now();
+            let mut last_heartbeat = Instant::now();
+            let mut forward_err: Option<String> = None;
+
+            for (batch_idx, chunk) in chunks.iter().enumerate() {
+                if last_heartbeat.elapsed() >= Duration::from_secs(30) {
+                    eprintln!(
+                        "[calibrate-settings] case {}/{} still running (elapsed={}s) — batch {}/{} (decomp_legs={})",
+                        case_no,
+                        total_cases,
+                        fwd_start.elapsed().as_secs(),
+                        batch_idx + 1,
+                        chunks.len(),
+                        legs
+                    );
+                    last_heartbeat = Instant::now();
+                }
+
+                let mut data = match attempt_circuit.load_graph_input(chunk) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        forward_err = Some(format!("failed to load circuit inputs: {}", e));
+                        break;
+                    }
+                };
+
+                let forward_res = match attempt_circuit.forward::<KZGCommitmentScheme<Bn256>>(
+                    &mut data,
+                    None,
+                    None,
+                    RegionSettings::all_true(local_run_args.decomp_base, local_run_args.decomp_legs),
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        forward_err = Some(format!("failed to forward: {}", e));
+                        break;
+                    }
+                };
+
+                match forward_pass_res.get_mut(&key) {
+                    Some(v) => v.push(forward_res),
+                    None => {
+                        forward_err = Some("key not found".to_string());
+                        break;
+                    }
+                }
+            }
+
+            if let Some(e) = forward_err {
+                // Decomposition overflow: retry with larger legs.
+                if is_decomp_overflow(&e) && legs < max_legs {
+                    eprintln!(
+                        "[calibrate-settings] case {}/{}: decomposition overflow at decomp_legs={}; retrying with decomp_legs={}",
+                        case_no,
+                        total_cases,
+                        legs,
+                        legs + 1
+                    );
+                    continue;
+                }
+
+                candidate_err = Some(e);
+                break;
+            }
+
+            // Success.
+            if legs != start_legs {
+                eprintln!(
+                    "[calibrate-settings] case {}/{}: succeeded after increasing decomp_legs {} -> {}",
+                    case_no, total_cases, start_legs, legs
+                );
+            }
+
+            circuit = Some(attempt_circuit);
+            candidate_err = None;
+            break;
+        }
+
+        if let Some(e) = candidate_err {
+            log::error!("calibration candidate failed: {:?}", e);
+            pb.inc(1);
+            num_failed += 1;
+            failure_reasons.push(format!(
+                "i-scale: {}, p-scale: {}, rebase-(x): {}, inner_cols: {}, decomp_legs: {}, reason: {}",
+                input_scale.to_string(),
+                param_scale.to_string(),
+                scale_rebase_multiplier.to_string(),
+                local_run_args.num_inner_cols.to_string(),
+                local_run_args.decomp_legs.to_string(),
+                e
+            ));
+            continue;
+        }
+
+        let mut circuit = match circuit {
+            Some(c) => c,
+            None => {
+                // Should be unreachable, but keep a clear error if it ever happens.
+                let e = "internal error: calibration succeeded but circuit is None".to_string();
+                log::error!("{}", e);
+                pb.inc(1);
+                num_failed += 1;
                 failure_reasons.push(format!(
-                    "i-scale: {}, p-scale: {}, rebase-(x): {}, reason: {}",
+                    "i-scale: {}, p-scale: {}, rebase-(x): {}, inner_cols: {}, decomp_legs: {}, reason: {}",
                     input_scale.to_string(),
                     param_scale.to_string(),
                     scale_rebase_multiplier.to_string(),
+                    local_run_args.num_inner_cols.to_string(),
+                    local_run_args.decomp_legs.to_string(),
                     e
                 ));
-                pb.inc(1);
-                num_failed += 1;
                 continue;
             }
         };
 
-        let forward_res = chunks
-            .iter()
-            .map(|chunk| -> Result<(), String> {
-                let chunk = chunk.clone();
-
-                let data = circuit
-                    .load_graph_input(&chunk)
-                    .map_err(|e| format!("failed to load circuit inputs: {}", e))?;
-
-                let forward_res = circuit
-                    .forward::<KZGCommitmentScheme<Bn256>>(
-                        &mut data.clone(),
-                        None,
-                        None,
-                        RegionSettings::all_true(
-                            settings.run_args.decomp_base,
-                            settings.run_args.decomp_legs,
-                        ),
-                    )
-                    .map_err(|e| format!("failed to forward: {}", e))?;
-
-                // push result to the hashmap
-                forward_pass_res
-                    .get_mut(&key)
-                    .ok_or("key not found")?
-                    .push(forward_res);
-
-                Ok(())
-            })
-            .collect::<Result<Vec<()>, String>>();
-
-        match forward_res {
-            Ok(_) => (),
-            // typically errors will be due to the circuit overflowing the i64 limit
-            Err(e) => {
-                log::error!("forward pass failed: {:?}", e);
-                pb.inc(1);
-                num_failed += 1;
-                failure_reasons.push(format!(
-                    "i-scale: {}, p-scale: {}, rebase-(x): {}, reason: {}",
-                    input_scale.to_string(),
-                    param_scale.to_string(),
-                    scale_rebase_multiplier.to_string(),
-                    e
-                ));
-                continue;
-            }
-        }
-
-        // drop the gag
-        #[cfg(all(not(not(feature = "ezkl")), unix))]
-        drop(_r);
-        #[cfg(all(not(not(feature = "ezkl")), unix))]
-        drop(_g);
-
-        let result = forward_pass_res.get(&key).ok_or("key not found")?;
+        let result = forward_pass_res
+            .get(&key)
+            .ok_or_else(|| EZKLError::msg("key not found"))?;
 
         let min_lookup_range = result
             .iter()
@@ -345,24 +497,79 @@ pub(crate) fn calibrate(
 
         let max_range_size = result.iter().map(|x| x.max_range_size).max().unwrap_or(0);
 
-        let res = circuit.calc_min_logrows(
-            (min_lookup_range, max_lookup_range),
-            max_range_size,
-            max_logrows,
-            lookup_safety_margin,
-        );
+        let observed_lookup_range = (min_lookup_range, max_lookup_range);
+        let observed_max_range_abs = max_range_size;
+
+        // Try to compute the minimal viable `logrows` for this candidate.
+        // If it fails due to k being too large, retry by widening the circuit (num_inner_cols *= 2).
+        let start_inner_cols = local_run_args.num_inner_cols;
+        let mut last_required_k: Option<u32> = None;
+
+        let res = loop {
+            let res = circuit.calc_min_logrows(
+                observed_lookup_range,
+                observed_max_range_abs,
+                max_logrows,
+                lookup_safety_margin,
+            );
+
+            match res {
+                Ok(()) => break Ok(()),
+                Err(crate::graph::errors::GraphError::ExtendedKTooLarge(required_k)) => {
+                    // Stop if we're already at (or above) our widening cap.
+                    if local_run_args.num_inner_cols >= auto_num_inner_cols_max {
+                        break Err(crate::graph::errors::GraphError::ExtendedKTooLarge(required_k));
+                    }
+
+                    // If required_k is not improving across retries, stop to avoid infinite loops.
+                    if last_required_k == Some(required_k) {
+                        break Err(crate::graph::errors::GraphError::ExtendedKTooLarge(required_k));
+                    }
+                    last_required_k = Some(required_k);
+
+                    let prev_cols = local_run_args.num_inner_cols;
+                    let next_cols =
+                        std::cmp::min(prev_cols.saturating_mul(2), auto_num_inner_cols_max);
+
+                    eprintln!(
+                        "[calibrate-settings] case {}/{}: required logrows {} exceeds max {}; retrying with num_inner_cols {} -> {}",
+                        case_no,
+                        total_cases,
+                        required_k,
+                        effective_max_k,
+                        prev_cols,
+                        next_cols
+                    );
+
+                    local_run_args.num_inner_cols = next_cols;
+
+                    // Rebuild the circuit so sizing metadata (num_rows / assignments / etc)
+                    // is recomputed under the wider layout.
+                    circuit = match GraphCircuit::from_run_args(&local_run_args, &model_path) {
+                        Ok(c) => c,
+                        Err(e) => break Err(e),
+                    };
+
+                    // Retry.
+                    continue;
+                }
+                Err(e) => break Err(e),
+            }
+        };
 
         if res.is_ok() {
-            let new_settings = circuit.settings().clone();
+            if local_run_args.num_inner_cols != start_inner_cols {
+                eprintln!(
+                    "[calibrate-settings] case {}/{}: succeeded after increasing num_inner_cols {} -> {}",
+                    case_no,
+                    total_cases,
+                    start_inner_cols,
+                    local_run_args.num_inner_cols
+                );
+            }
 
-            let found_run_args = RunArgs {
-                input_scale: new_settings.run_args.input_scale,
-                param_scale: new_settings.run_args.param_scale,
-                lookup_range: new_settings.run_args.lookup_range,
-                logrows: new_settings.run_args.logrows,
-                scale_rebase_multiplier: new_settings.run_args.scale_rebase_multiplier,
-                ..settings.run_args.clone()
-            };
+            let new_settings = circuit.settings().clone();
+            let found_run_args = new_settings.run_args.clone();
 
             let found_settings = GraphSettings {
                 run_args: found_run_args,
@@ -381,16 +588,11 @@ pub(crate) fn calibrate(
 
             found_params.push(found_settings.clone());
 
-            // Pretty-print if optional `colored_json` dependency is enabled; otherwise fall back
-            // to plain JSON. Importantly: do NOT propagate a `colored_json` formatting error via `?`
-            // (it may not implement conversion into `EZKLError`).
             let found_settings_json = found_settings.as_json()?;
             let found_settings_json = found_settings_json.to_string();
 
             #[cfg(all(feature = "colored_json", not(target_arch = "wasm32")))]
             {
-                // `colored_json::prelude::ToColoredJson` is implemented for `AsRef<str>` (e.g. `String` / `&str`),
-                // so colorize the JSON string directly (no need to parse into `serde_json::Value`).
                 let maybe_colored = found_settings_json.to_colored_json_auto().ok();
 
                 log::debug!(
@@ -407,10 +609,12 @@ pub(crate) fn calibrate(
             num_passed += 1;
         } else if let Err(res) = res {
             failure_reasons.push(format!(
-                "i-scale: {}, p-scale: {}, rebase-(x): {}, reason: {}",
+                "i-scale: {}, p-scale: {}, rebase-(x): {}, inner_cols: {}, decomp_legs: {}, reason: {}",
                 input_scale.to_string(),
                 param_scale.to_string(),
                 scale_rebase_multiplier.to_string(),
+                local_run_args.num_inner_cols.to_string(),
+                local_run_args.decomp_legs.to_string(),
                 res.to_string()
             ));
             num_failed += 1;
@@ -422,31 +626,49 @@ pub(crate) fn calibrate(
     pb.finish_with_message("Calibration Done.");
 
     if found_params.is_empty() {
+        // NOTE:
+        // Historically we only logged per-candidate failure reasons via `log::error!`, but if the
+        // CLI is run without a logger configured those details are lost and users only see the
+        // generic message below. Surface the reasons in the returned error instead so callers
+        // (including benchmark runners) can diagnose failures.
+        let mut msg = String::from(
+            "calibration failed, could not find any suitable parameters given the calibration dataset",
+        );
+
         if !failure_reasons.is_empty() {
-            log::error!("Calibration failed for the following reasons:");
-            for reason in failure_reasons {
-                log::error!("{}", reason);
+            const MAX_REASONS: usize = 20;
+
+            msg.push_str("\n\nFailure reasons (first ");
+            msg.push_str(&std::cmp::min(MAX_REASONS, failure_reasons.len()).to_string());
+            msg.push_str("):\n");
+
+            for (i, reason) in failure_reasons.iter().take(MAX_REASONS).enumerate() {
+                msg.push_str(&format!("  {}) {}\n", i + 1, reason));
+            }
+
+            if failure_reasons.len() > MAX_REASONS {
+                msg.push_str(&format!(
+                    "  ... ({} more)\n",
+                    failure_reasons.len() - MAX_REASONS
+                ));
             }
         }
 
-        return Err("calibration failed, could not find any suitable parameters given the calibration dataset".into());
+        return Err(EZKLError::msg(msg));
     }
 
     log::debug!("Found {} sets of parameters", found_params.len());
 
-    // now find the best params according to the target
     let mut best_params = match target {
         CalibrationTarget::Resources { .. } => {
             let mut param_iterator = found_params.iter().sorted_by_key(|p| p.run_args.logrows);
 
             let min_logrows = param_iterator
                 .next()
-                .ok_or("no params found")?
+                .ok_or_else(|| EZKLError::msg("no params found"))?
                 .run_args
                 .logrows;
 
-            // pick the ones that have the minimum logrows but also the largest scale:
-            // this is the best tradeoff between resource usage and accuracy
             found_params
                 .iter()
                 .filter(|p| p.run_args.logrows == min_logrows)
@@ -454,11 +676,10 @@ pub(crate) fn calibrate(
                     (
                         p.run_args.input_scale,
                         p.run_args.param_scale,
-                        // we want the largest rebase multiplier as it means we can use less constraints
                         p.run_args.scale_rebase_multiplier,
                     )
                 })
-                .ok_or("no params found")?
+                .ok_or_else(|| EZKLError::msg("no params found"))?
                 .clone()
         }
         CalibrationTarget::Accuracy => {
@@ -466,20 +687,17 @@ pub(crate) fn calibrate(
                 (
                     p.run_args.input_scale,
                     p.run_args.param_scale,
-                    // we want the largest rebase multiplier as it means we can use less constraints
                     p.run_args.scale_rebase_multiplier,
                 )
             });
 
-            let last = param_iterator.next_back().ok_or("no params found")?;
+            let last = param_iterator.next_back().ok_or_else(|| EZKLError::msg("no params found"))?;
             let max_scale = (
                 last.run_args.input_scale,
                 last.run_args.param_scale,
                 last.run_args.scale_rebase_multiplier,
             );
 
-            // pick the ones that have the max scale but also the smallest logrows:
-            // this is the best tradeoff between resource usage and accuracy
             found_params
                 .iter()
                 .filter(|p| {
@@ -490,7 +708,7 @@ pub(crate) fn calibrate(
                     ) == max_scale
                 })
                 .min_by_key(|p| p.run_args.logrows)
-                .ok_or("no params found")?
+                .ok_or_else(|| EZKLError::msg("no params found"))?
                 .clone()
         }
     };
@@ -501,7 +719,7 @@ pub(crate) fn calibrate(
             best_params.run_args.param_scale,
             best_params.run_args.scale_rebase_multiplier,
         ))
-        .ok_or("no params found")?
+        .ok_or_else(|| EZKLError::msg("no params found"))?
         .iter()
         .map(|x| x.get_float_outputs(&best_params.model_output_scales))
         .collect::<Vec<_>>();
@@ -565,7 +783,6 @@ pub(crate) fn mock(
     compiled_circuit_path: PathBuf,
     data_path: PathBuf,
 ) -> Result<String, EZKLError> {
-    // mock should catch any issues by default so we set it to safe
     let mut circuit = GraphCircuit::load(compiled_circuit_path)?;
 
     let data = GraphWitness::from_path(data_path)?;
@@ -581,235 +798,9 @@ pub(crate) fn mock(
         &circuit,
         vec![public_inputs],
     )
-    .map_err(|e| ExecutionError::MockProverError(e.to_string()))?;
+        .map_err(|e| ExecutionError::MockProverError(e.to_string()))?;
 
     prover.verify().map_err(ExecutionError::VerifyError)?;
-    Ok(String::new())
-}
-
-#[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-pub(crate) async fn create_evm_verifier(
-    vk_path: PathBuf,
-    srs_path: Option<PathBuf>,
-    settings_path: PathBuf,
-    sol_code_path: PathBuf,
-    abi_path: PathBuf,
-    reusable: bool,
-) -> Result<String, EZKLError> {
-    let settings = GraphSettings::load(&settings_path)?;
-    let params =
-        load_params_verifier::<KZGCommitmentScheme<Bn256>>(srs_path, settings.run_args.logrows)?;
-
-    let num_instance = settings.total_instances();
-    // create a scales array that is the same length as the number of instances, all populated with 0
-    let scales = vec![0; num_instance.len()];
-    // let poseidon_instance = settings.module_sizes.num_instances().iter().sum::<usize>();
-
-    let vk = load_vk::<KZGCommitmentScheme<Bn256>, GraphCircuit>(vk_path, settings)?;
-    log::trace!("params computed");
-
-    let generator = halo2_solidity_verifier::SolidityGenerator::new(
-        &params,
-        &vk,
-        halo2_solidity_verifier::BatchOpenScheme::Bdfg21,
-        &num_instance,
-        &scales,
-        0,
-        0,
-    );
-    let (verifier_solidity, name) = if reusable {
-        (generator.render_separately()?.0, "Halo2VerifierReusable") // ignore the rendered vk artifact for now and generate it in create_evm_vka
-    } else {
-        (generator.render()?, "Halo2Verifier")
-    };
-
-    File::create(sol_code_path.clone())?.write_all(verifier_solidity.as_bytes())?;
-
-    // fetch abi of the contract
-    let (abi, _, _) = get_contract_artifacts(sol_code_path, name, 0).await?;
-    // save abi to file
-    serde_json::to_writer(std::fs::File::create(abi_path)?, &abi)?;
-
-    Ok(String::new())
-}
-
-#[cfg(feature = "reusable-verifier")]
-pub(crate) async fn create_evm_vka(
-    vk_path: PathBuf,
-    srs_path: Option<PathBuf>,
-    settings_path: PathBuf,
-    vka_path: PathBuf,
-    decimals: usize,
-) -> Result<String, EZKLError> {
-    log::warn!("Reusable verifier support is experimental and may change in the future. Use at your own risk.");
-    let settings = GraphSettings::load(&settings_path)?;
-    let params =
-        load_params_verifier::<KZGCommitmentScheme<Bn256>>(srs_path, settings.run_args.logrows)?;
-
-    let num_poseidon_instance = settings.module_sizes.num_instances().iter().sum::<usize>();
-    let num_fixed_point_instance = settings
-        .model_instance_shapes
-        .iter()
-        .map(|x| x.iter().product::<usize>())
-        .collect_vec();
-
-    let scales = settings.get_model_instance_scales();
-    let vk = load_vk::<KZGCommitmentScheme<Bn256>, GraphCircuit>(vk_path, settings)?;
-    log::trace!("params computed");
-    // assert that the decimals must be less than or equal to 38 to prevent overflow
-    if decimals > 38 {
-        return Err("decimals must be less than or equal to 38".into());
-    }
-
-    let generator = halo2_solidity_verifier::SolidityGenerator::new(
-        &params,
-        &vk,
-        halo2_solidity_verifier::BatchOpenScheme::Bdfg21,
-        &num_fixed_point_instance,
-        &scales,
-        decimals,
-        num_poseidon_instance,
-    );
-
-    let vka_words: Vec<[u8; 32]> = generator.render_separately_vka_words()?.1;
-    let serialized_vka_words = bincode::serialize(&vka_words).or_else(|e| {
-        Err(EZKLError::from(format!(
-            "Failed to serialize vka words: {}",
-            e
-        )))
-    })?;
-
-    File::create(vka_path.clone())?.write_all(&serialized_vka_words)?;
-
-    // Load in the vka words and deserialize them and check that they match the original
-    let bytes = std::fs::read(vka_path)?;
-    let vka_buf: Vec<[u8; 32]> = bincode::deserialize(&bytes)
-        .map_err(|e| EZKLError::from(format!("Failed to deserialize vka words: {e}")))?;
-    if vka_buf != vka_words {
-        return Err("vka words do not match".into());
-    };
-
-    Ok(String::new())
-}
-#[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-pub(crate) async fn deploy_evm(
-    sol_code_path: PathBuf,
-    rpc_url: String,
-    addr_path: PathBuf,
-    runs: usize,
-    private_key: Option<String>,
-    contract: ContractType,
-) -> Result<String, EZKLError> {
-    let contract_name = match contract {
-        ContractType::Verifier { reusable: false } => "Halo2Verifier",
-        ContractType::Verifier { reusable: true } => "Halo2VerifierReusable",
-    };
-    let contract_address = deploy_contract_via_solidity(
-        sol_code_path,
-        &rpc_url,
-        runs,
-        private_key.as_deref(),
-        contract_name,
-    )
-    .await?;
-
-    log::info!("Contract deployed at: {:#?}", contract_address);
-
-    let mut f = File::create(addr_path)?;
-    write!(f, "{:#?}", contract_address)?;
-    Ok(String::new())
-}
-
-#[cfg(all(feature = "reusable-verifier", not(target_arch = "wasm32")))]
-pub(crate) async fn register_vka(
-    rpc_url: String,
-    rv_addr: H160Flag,
-    vka_path: PathBuf,
-    vka_digest_path: PathBuf,
-    private_key: Option<String>,
-) -> Result<String, EZKLError> {
-    log::warn!("Reusable verifier support is experimental and may change in the future. Use at your own risk.");
-    // Load the vka, which is bincode serialized, from the vka_path
-    let bytes = std::fs::read(vka_path)?;
-    let vka_buf: Vec<[u8; 32]> = bincode::deserialize(&bytes)
-        .map_err(|e| EZKLError::from(format!("Failed to deserialize vka words: {e}")))?;
-    let vka_digest = register_vka_via_rv(
-        rpc_url.as_ref(),
-        private_key.as_deref(),
-        rv_addr.into(),
-        &vka_buf,
-    )
-    .await?;
-
-    log::info!("VKA digest: {:#?}", vka_digest);
-
-    let mut f = File::create(vka_digest_path)?;
-    write!(f, "{:#?}", vka_digest)?;
-    Ok(String::new())
-}
-
-/// Encodes the calldata for the EVM verifier
-/// TODO: Add a "RV address param" which will query the "RegisteredVKA" events to fetch the
-/// VKA from the vka_digest.
-#[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-pub(crate) fn encode_evm_calldata(
-    proof_path: PathBuf,
-    calldata_path: PathBuf,
-    vka_path: Option<PathBuf>,
-) -> Result<Vec<u8>, EZKLError> {
-    let snark = Snark::load::<KZGCommitmentScheme<Bn256>>(&proof_path)?;
-
-    let flattened_instances = snark.instances.into_iter().flatten();
-
-    // Load the vka, which is bincode serialized, from the vka_path
-    let vka_buf: Option<Vec<[u8; 32]>> =
-        match vka_path {
-            Some(path) => {
-                let bytes = std::fs::read(path)?;
-                Some(bincode::deserialize(&bytes).map_err(|e| {
-                    EZKLError::from(format!("Failed to deserialize vka words: {e}"))
-                })?)
-            }
-            None => None,
-        };
-
-    let vka: Option<&[[u8; 32]]> = vka_buf.as_deref();
-    let encoded = encode_calldata(vka, &snark.proof, &flattened_instances.collect::<Vec<_>>());
-
-    log::debug!("Encoded calldata: {:?}", encoded);
-
-    File::create(calldata_path)?.write_all(encoded.as_slice())?;
-
-    Ok(encoded)
-}
-
-/// TODO: Add an optional vka_digest param that will allow us to fetch the associated VKA
-/// from the RegisteredVKA events on the RV.
-#[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-pub(crate) async fn verify_evm(
-    proof_path: PathBuf,
-    addr_verifier: H160Flag,
-    rpc_url: String,
-    vka_path: Option<PathBuf>,
-    encoded_calldata: Option<PathBuf>,
-) -> Result<String, EZKLError> {
-    let proof = Snark::load::<KZGCommitmentScheme<Bn256>>(&proof_path)?;
-
-    let result = verify_proof_via_solidity(
-        proof.clone(),
-        addr_verifier.into(),
-        vka_path.map(|s| s.into()),
-        rpc_url.as_ref(),
-        encoded_calldata.map(|s| s.into()),
-    )
-    .await?;
-
-    log::info!("Solidity verification result: {}", result);
-
-    if !result {
-        return Err("Solidity verification failed".into());
-    }
-
     Ok(String::new())
 }
 
@@ -832,8 +823,6 @@ pub(crate) fn setup(
     witness: Option<PathBuf>,
     disable_selector_compression: bool,
 ) -> Result<String, EZKLError> {
-    // these aren't real values so the sanity checks are mostly meaningless
-
     let mut circuit = GraphCircuit::load(compiled_circuit)?;
 
     if let Some(witness) = witness {
@@ -877,20 +866,24 @@ pub(crate) fn prove(
     let proof_split_commits: Option<ProofSplitCommit> = data.into();
 
     let logrows = circuit_settings.run_args.logrows;
-    // creates and verifies the proof
 
     let pk = load_pk::<KZGCommitmentScheme<Bn256>, GraphCircuit>(pk_path, circuit.params())?;
 
     let params = load_params_prover::<KZGCommitmentScheme<Bn256>>(srs_path, logrows)?;
+
+    type E = Challenge255<G1Affine>;
+    type TW = Blake2bWrite<Vec<u8>, G1Affine, E>;
+    type TR = Blake2bRead<Cursor<Vec<u8>>, G1Affine, E>;
+
     let mut snark = create_proof_circuit::<
         KZGCommitmentScheme<Bn256>,
         _,
         ProverSHPLONK<_>,
         VerifierSHPLONK<_>,
         KZGSingleStrategy<_>,
-        _,
-        EvmTranscript<_, _, _, _>,
-        EvmTranscript<_, _, _, _>,
+        E,
+        TW,
+        TR,
     >(
         circuit,
         vec![public_inputs],
@@ -901,7 +894,7 @@ pub(crate) fn prove(
         None,
     )?;
 
-    snark.pretty_public_inputs = pretty_public_inputs;
+    snark.pretty_public_inputs = Some(pretty_public_inputs);
 
     if let Some(proof_path) = proof_path {
         snark.save(&proof_path)?;
@@ -918,11 +911,10 @@ pub(crate) fn swap_proof_commitments_cmd(
     let witness = GraphWitness::from_path(witness)?;
     let commitments = witness.get_polycommitments();
 
-    let snark_new = swap_proof_commitments::<
-        KZGCommitmentScheme<Bn256>,
-        _,
-        EvmTranscript<G1Affine, _, _, _>,
-    >(&snark, &commitments)?;
+    type E = Challenge255<G1Affine>;
+    type TW = Blake2bWrite<Vec<u8>, G1Affine, E>;
+
+    let snark_new = swap_proof_commitments::<KZGCommitmentScheme<Bn256>, E, TW>(&snark, &commitments)?;
 
     if snark_new.proof != *snark.proof {
         log::warn!("swap proof has created a different proof");
@@ -944,18 +936,20 @@ pub(crate) fn verify(
     let logrows = circuit_settings.run_args.logrows;
 
     let params: ParamsKZG<Bn256> = if reduced_srs {
-        // only need G_0 for the verification with shplonk
         load_params_verifier::<KZGCommitmentScheme<Bn256>>(srs_path, 1)?
     } else {
         load_params_verifier::<KZGCommitmentScheme<Bn256>>(srs_path, logrows)?
     };
 
+    type E = Challenge255<G1Affine>;
+    type TR = Blake2bRead<Cursor<Vec<u8>>, G1Affine, E>;
+
     verify_commitment::<
         KZGCommitmentScheme<Bn256>,
         VerifierSHPLONK<'_, Bn256>,
-        _,
+        E,
         KZGSingleStrategy<_>,
-        EvmTranscript<G1Affine, _, _, _>,
+        TR,
         GraphCircuit,
         _,
     >(proof_path, circuit_settings, vk_path, &params, logrows)
@@ -979,10 +973,10 @@ fn verify_commitment<
 ) -> Result<bool, EZKLError>
 where
     Scheme::Scalar: FromUniformBytes<64>
-        + SerdeObject
-        + Serialize
-        + DeserializeOwned
-        + WithSmallOrderMulGroup<3>,
+    + SerdeObject
+    + Serialize
+    + DeserializeOwned
+    + WithSmallOrderMulGroup<3>,
     Scheme::Curve: SerdeObject + Serialize + DeserializeOwned,
     Scheme::ParamsVerifier: 'a,
 {

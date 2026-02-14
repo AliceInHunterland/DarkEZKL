@@ -87,6 +87,17 @@ pub enum GraphError {
     /// Circuit error
     #[error("[circuit] {0}")]
     CircuitError(#[from] crate::circuit::CircuitError),
+    /// Circuit layout failed for a specific node/op (keeps the underlying CircuitError intact).
+    #[error("layout failed for node {idx} ({op}): {source}")]
+    OpLayoutError {
+        /// Node index in the parsed graph.
+        idx: usize,
+        /// Human-readable op name / description.
+        op: String,
+        /// The underlying circuit error.
+        #[source]
+        source: crate::circuit::CircuitError,
+    },
     /// Halo2 error
     #[error("[halo2] {0}")]
     Halo2Error(#[from] halo2_proofs::plonk::Error),

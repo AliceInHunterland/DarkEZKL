@@ -1264,7 +1264,13 @@ impl Model {
                     ((idx, equation.clone()), indices_to_dims.clone())
                 })
                 .collect();
-            let analysis = analyze_einsum_usage(&used_einsums)?;
+            let analysis = analyze_einsum_usage(
+                &used_einsums,
+                &RegionSettings::all_true(
+                    settings.run_args.decomp_base,
+                    settings.run_args.decomp_legs,
+                ),
+            )?;
             base_gate.configure_einsums(meta, &analysis, num_inner_cols, logrows)?;
         }
 
@@ -1484,13 +1490,24 @@ impl Model {
                             .ok_or(GraphError::MissingConstants)?;
                         Some(c.quantized_values.clone().try_into()?)
                     } else {
-                        config
+                        // IMPORTANT:
+                        // Do **not** collapse layout errors into a generic Halo2 "synthesis error".
+                        // That hides the real root-cause from `ezkl gen-settings`, since settings
+                        // generation runs the model through a dummy layout pass.
+                        let op = n.opkind.as_string();
+                        match config
                             .base
                             .layout(region, &values.iter().collect_vec(), n.opkind.clone_dyn())
-                            .map_err(|e| {
-                                error!("{}", e);
-                                halo2_proofs::plonk::Error::Synthesis
-                            })?
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return Err(GraphError::OpLayoutError {
+                                    idx: *idx,
+                                    op,
+                                    source: e,
+                                });
+                            }
+                        }
                     };
 
                     if let Some(vt) = &mut res {

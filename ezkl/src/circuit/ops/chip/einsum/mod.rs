@@ -1013,9 +1013,13 @@ fn layout_probabilistic_freivalds_matmul<F: PrimeField + TensorType + PartialOrd
             .ok_or(CircuitError::UnsupportedOp)
     };
 
-    let m = left_axes.iter().copied().map(dim).try_fold(1usize, |acc, v| Ok(acc * v?))?;
-    let n = contract_axes.iter().copied().map(dim).try_fold(1usize, |acc, v| Ok(acc * v?))?;
-    let p = right_axes.iter().copied().map(dim).try_fold(1usize, |acc, v| Ok(acc * v?))?;
+    let m = left_axes
+        .iter()
+        .copied()
+        .map(dim)
+        .try_fold(1usize, |acc, v| v.map(|vv| acc * vv))?;
+    let n = contract_axes.iter().copied().map(dim).try_fold(1usize, |acc, v| Ok::<usize, crate::circuit::CircuitError>(acc * v?))?;
+    let p = right_axes.iter().copied().map(dim).try_fold(1usize, |acc, v| Ok::<usize, crate::circuit::CircuitError>(acc * v?))?;
 
     // Batch cartesian product
     let mut batch_indices = batch_axes

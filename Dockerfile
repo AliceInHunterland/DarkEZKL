@@ -15,6 +15,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     RUST_BACKTRACE=1 \
     EZKL_DIR=/root/.ezkl \
+    \
+    # SRS download mirrors have started returning HTTP 403 in many environments.
+    # For benchmarking we allow an automatic fallback to a locally-generated (DUMMY) SRS.
+    # Override at runtime with:  -e EZKL_SRS_SOURCE=public
+    EZKL_SRS_SOURCE=auto \
+    \
     ENABLE_ICICLE_GPU=true \
     TORCH_HOME=/app/.cache/torch \
     XDG_CACHE_HOME=/app/.cache \
@@ -91,12 +97,20 @@ WORKDIR /app
 COPY . .
 
 # ---- Build & install ezkl CLI ----
+# IMPORTANT:
+# We build the CLI with `--no-default-features --features ezkl` to avoid pulling in
+# optional feature-sets (notably `eth`) that can introduce `halo2_proofs` version
+# conflicts via downstream crates.
+#
+# We also install the resulting binary into /usr/local/bin so it is available even if
+# users bind-mount /root/.ezkl (SRS cache) and hide anything that might exist there.
 RUN . "$HOME/.cargo/env" && \
     cd ezkl && \
     LOCKED=""; if [ -f Cargo.lock ]; then LOCKED="--locked"; fi; \
-    cargo install --force ${LOCKED} --path . && \
+    cargo install --force ${LOCKED} --path . --no-default-features --features "ezkl" && \
+    install -m 0755 "$HOME/.cargo/bin/ezkl" /usr/local/bin/ezkl && \
     mkdir -p "${EZKL_DIR}" && \
-    if [ -f "$HOME/.cargo/bin/ezkl" ]; then ln -sf "$HOME/.cargo/bin/ezkl" "${EZKL_DIR}/ezkl"; fi
+    ln -sf /usr/local/bin/ezkl "${EZKL_DIR}/ezkl"
 
 # Optional Python deps for ezkl (do not fail build if file isn't present)
 RUN cd ezkl && \

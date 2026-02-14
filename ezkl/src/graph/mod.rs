@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-#[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
-use tosubcommand::ToFlags;
-
 #[cfg(feature = "python-bindings")]
 use pyo3::{conversion::FromPyObject, exceptions::PyValueError, prelude::*, IntoPyObject};
 
@@ -28,8 +25,12 @@ pub mod config;
 /// Graph witness (witness.json) and related helpers.
 pub mod witness;
 
+/// GraphCircuit (compiled circuit) wrapper around Model + GraphSettings.
+pub mod circuit;
+
 pub use config::*;
 pub use witness::*;
+pub use circuit::*;
 
 pub use input::DataSource;
 pub use model::*;
@@ -82,13 +83,6 @@ impl<'source> FromPyObject<'source> for ExecutionMode {
             "probabilistic" => Ok(ExecutionMode::Probabilistic),
             _ => Err(PyValueError::new_err("Invalid value for ExecutionMode")),
         }
-    }
-}
-
-#[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
-impl ToFlags for ExecutionMode {
-    fn to_flags(&self) -> Vec<String> {
-        vec![format!("{}", self)]
     }
 }
 
@@ -147,13 +141,6 @@ impl FromStr for ProbOps {
     }
 }
 
-#[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
-impl ToFlags for ProbOps {
-    fn to_flags(&self) -> Vec<String> {
-        vec![format!("{}", self)]
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, PartialOrd, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbSeedMode {
@@ -209,13 +196,6 @@ impl<'source> FromPyObject<'source> for ProbSeedMode {
             "fiat_shamir" => Ok(ProbSeedMode::FiatShamir),
             _ => Err(PyValueError::new_err("Invalid value for ProbSeedMode")),
         }
-    }
-}
-
-#[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
-impl ToFlags for ProbSeedMode {
-    fn to_flags(&self) -> Vec<String> {
-        vec![format!("{}", self)]
     }
 }
 

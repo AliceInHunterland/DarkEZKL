@@ -21,6 +21,7 @@ import platform
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -230,18 +231,18 @@ def _gather_env_report() -> Dict[str, Any]:
 
 
 def _run_one_case_subprocess(
-    *,
-    model_name: str,
-    prob_k: int,
-    run_index: int,
-    out_dir: Path,
-    cache_dir: Optional[Path],
-    prob_ops: List[str],
-    prob_seed_mode: str,
-    skip_verify: bool,
-    skip_mock: bool,
-    timeout_s: int,
-    tail_lines: int,
+        *,
+        model_name: str,
+        prob_k: int,
+        run_index: int,
+        out_dir: Path,
+        cache_dir: Optional[Path],
+        prob_ops: List[str],
+        prob_seed_mode: str,
+        skip_verify: bool,
+        skip_mock: bool,
+        timeout_s: int,
+        tail_lines: int,
 ) -> Dict[str, Any]:
     bench_vit_path = Path(__file__).with_name("bench_vit.py")
     run_dir = _ensure_dir(out_dir)
@@ -308,16 +309,16 @@ def _run_one_case_subprocess(
 
 
 def _run_one_case_inprocess(
-    *,
-    model_name: str,
-    prob_k: int,
-    run_index: int,
-    out_dir: Path,
-    cache_dir: Optional[Path],
-    prob_ops: List[str],
-    prob_seed_mode: str,
-    skip_verify: bool,
-    skip_mock: bool,
+        *,
+        model_name: str,
+        prob_k: int,
+        run_index: int,
+        out_dir: Path,
+        cache_dir: Optional[Path],
+        prob_ops: List[str],
+        prob_seed_mode: str,
+        skip_verify: bool,
+        skip_mock: bool,
 ) -> Dict[str, Any]:
     t0 = time.perf_counter()
     try:
@@ -355,6 +356,16 @@ def _run_one_case_inprocess(
         }
     except Exception as e:  # noqa: BLE001
         elapsed_s = time.perf_counter() - t0
+        tb = traceback.format_exc()
+
+        diag_path = out_dir / "inprocess_error.txt"
+        try:
+            _ensure_dir(out_dir)
+            diag_path.write_text(tb, encoding="utf-8")
+        except Exception:
+            # Best-effort only; do not mask the original exception.
+            pass
+
         return {
             "ok": False,
             "model_name": model_name,
@@ -363,6 +374,8 @@ def _run_one_case_inprocess(
             "elapsed_s": float(elapsed_s),
             "run_dir": str(out_dir),
             "error": repr(e),
+            "traceback": tb,
+            "diagnostic": str(diag_path),
         }
 
 
@@ -380,10 +393,10 @@ def _extract_timing_s(metrics: Dict[str, Any], key: str) -> Optional[float]:
 
 
 def _make_plot_payload_from_cases(
-    *,
-    cases: List[Dict[str, Any]],
-    models: List[str],
-    prob_k_values: List[int],
+        *,
+        cases: List[Dict[str, Any]],
+        models: List[str],
+        prob_k_values: List[int],
 ) -> Dict[str, Any]:
     """
     Produce a JSON payload compatible with `ezkl_bench.plotting.plot`.
@@ -573,11 +586,28 @@ def main() -> int:
     cases: List[Dict[str, Any]] = []
     suite_t0 = time.perf_counter()
 
+    total_cases = len(models) * len(prob_k_values) * runs
+    case_counter = 0
+
+    print(f"\n{'='*80}")
+    print(f"Starting benchmark suite:")
+    print(f"  Models: {models}")
+    print(f"  prob_k values: {prob_k_values}")
+    print(f"  Runs per case: {runs}")
+    print(f"  Total cases: {total_cases}")
+    print(f"  Isolation: {isolate}")
+    print(f"{'='*80}\n")
+
     for model_name in models:
         for prob_k in prob_k_values:
             for run_index in range(runs):
+                case_counter += 1
                 run_dir = outdir / "runs" / str(model_name) / f"k{int(prob_k)}" / f"run{int(run_index)}"
                 _ensure_dir(run_dir)
+
+                print(f"\n[{case_counter}/{total_cases}] Running: model={model_name}, prob_k={prob_k}, run={run_index}")
+                print(f"  Output dir: {run_dir}")
+                case_start = time.perf_counter()
 
                 if isolate:
                     case = _run_one_case_subprocess(
@@ -607,6 +637,18 @@ def main() -> int:
                     )
 
                 cases.append(case)
+                case_elapsed = time.perf_counter() - case_start
+
+                status = "✓ OK" if case.get("ok") else "✗ FAILED"
+                print(f"  {status} - Elapsed: {case_elapsed:.1f}s")
+
+                # Calculate and show estimated time remaining
+                if case_counter < total_cases:
+                    avg_time_per_case = (time.perf_counter() - suite_t0) / case_counter
+                    remaining_cases = total_cases - case_counter
+                    eta_seconds = avg_time_per_case * remaining_cases
+                    eta_minutes = eta_seconds / 60
+                    print(f"  ETA for remaining {remaining_cases} cases: ~{eta_minutes:.1f} minutes")
 
                 # Persist incremental progress so partial failures still leave artifacts.
                 _write_json(outdir / "benchmark_partial.json", {"suite": suite_cfg, "env": env_report, "cases": cases})

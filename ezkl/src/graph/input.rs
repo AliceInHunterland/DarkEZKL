@@ -290,7 +290,7 @@ impl GraphData {
         let reader = std::fs::File::open(&path).map_err(|e| {
             GraphError::ReadWriteFileError(path.display().to_string(), e.to_string())
         })?;
-        let mut reader = BufReader::with_capacity(*EZKL_BUF_CAPACITY, reader);
+        let mut reader = BufReader::with_capacity(EZKL_BUF_CAPACITY, reader);
         let mut buf = String::new();
         reader.read_to_string(&mut buf).map_err(|e| {
             GraphError::ReadWriteFileError(path.display().to_string(), e.to_string())
@@ -307,7 +307,7 @@ impl GraphData {
         let file = std::fs::File::create(path.clone()).map_err(|e| {
             GraphError::ReadWriteFileError(path.display().to_string(), e.to_string())
         })?;
-        let writer = BufWriter::with_capacity(*EZKL_BUF_CAPACITY, file);
+        let writer = BufWriter::with_capacity(EZKL_BUF_CAPACITY, file);
         serde_json::to_writer(writer, self)?;
         Ok(())
     }

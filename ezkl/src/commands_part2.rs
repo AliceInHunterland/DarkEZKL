@@ -1,41 +1,11 @@
-/// Execution mode for EZKL: exact constraints vs probabilistic verification.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-#[clap(rename_all = "snake_case")]
-pub enum ExecutionMode {
-    /// Default / current behavior: exact constraints for all supported ops.
-    Exact,
-    /// Opt-in: selected high-cost linear ops can be checked probabilistically.
-    Probabilistic,
-}
-
-/// Seed/challenge mode for probabilistic execution.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-#[clap(rename_all = "snake_case")]
-pub enum ProbSeedMode {
-    /// Challenges come from a public seed (recommended).
-    #[serde(alias = "public_seed")]
-    #[value(alias = "public_seed")]
-    Public,
-    /// Challenges derived via Fiat-Shamir (convenience mode; threat-model dependent).
-    #[serde(alias = "fiat-shamir")]
-    #[value(alias = "fiat-shamir")]
-    FiatShamir,
-}
+// Re-export the "execution contract" types from the settings layer so the CLI and settings.json
+// share a single set of enums/structs.
+pub use crate::graph::{ExecutionMode, ProbOp, ProbOps, ProbSeedMode, ProbabilisticSettings};
 
 pub const DEFAULT_EXECUTION_MODE: ExecutionMode = ExecutionMode::Exact;
 pub const DEFAULT_PROB_K_U32: u32 = 40;
 pub const DEFAULT_PROB_OPS: &str = "MatMul,Gemm,Conv";
-pub const DEFAULT_PROB_SEED_MODE: ProbSeedMode = ProbSeedMode::Public;
-
-fn default_prob_ops_vec() -> Vec<String> {
-    DEFAULT_PROB_OPS
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
+pub const DEFAULT_PROB_SEED_MODE: ProbSeedMode = ProbSeedMode::PublicSeed;
 
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Args)]
@@ -70,15 +40,15 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 2)]
     pub num_inner_cols: usize,
 
-    /// string: accepts `public`, `private`, `fixed`, `hashed/public`, `hashed/private`, `polycommit`
+    /// string: accepts `public`, `private`, `fixed`, `hashed/public`, `hashed/private/<outlets>`, `polycommit`
     #[arg(long, default_value_t = Visibility::Private)]
     pub input_visibility: Visibility,
 
-    /// string: accepts `public`, `private`, `fixed`, `hashed/public`, `hashed/private`, `polycommit`
+    /// string: accepts `public`, `private`, `fixed`, `hashed/public`, `hashed/private/<outlets>`, `polycommit`
     #[arg(long, default_value_t = Visibility::Public)]
     pub output_visibility: Visibility,
 
-    /// string: accepts `public`, `private`, `fixed`, `hashed/public`, `hashed/private`, `polycommit`
+    /// string: accepts `public`, `private`, `fixed`, `hashed/public`, `hashed/private/<outlets>`, `polycommit`
     #[arg(long, default_value_t = Visibility::Private)]
     pub param_visibility: Visibility,
 
@@ -104,7 +74,13 @@ pub struct RunArgs {
     pub decomp_base: usize,
 
     /// int: The number of legs used for decomposition
-    #[arg(long, default_value_t = 2)]
+    ///
+    /// IMPORTANT:
+    /// A too-small value can make `calibrate-settings` fail with:
+    ///   "[tensor] decomposition error: integer X is too large to be represented by base 128 and n <legs>"
+    ///
+    /// We default to 5 (instead of 4) so typical NN activations fit during calibration/witnessing.
+    #[arg(long, default_value_t = 5)]
     pub decomp_legs: usize,
 
     /// bool: Should the circuit use unbounded lookups for log
@@ -123,25 +99,21 @@ pub struct RunArgs {
     #[arg(long, default_value_t = false)]
     pub disable_freivalds: bool,
 
-    // --- probabilistic execution settings (Step 1) ---
+    // --- probabilistic execution settings ---
 
     /// str: execution mode, accepts `exact` or `probabilistic`
     #[arg(long = "execution-mode", default_value_t = DEFAULT_EXECUTION_MODE)]
     pub execution_mode: ExecutionMode,
 
-    /// list[str]: ops to apply probabilistic checks to (comma-separated). Example: MatMul,Gemm,Conv
-    #[arg(
-        long = "prob-ops",
-        value_delimiter = ',',
-        default_value = DEFAULT_PROB_OPS
-    )]
-    pub prob_ops: Vec<String>,
+    /// str: ops to apply probabilistic checks to (comma-separated). Example: MatMul,Gemm,Conv
+    #[arg(long = "prob-ops", default_value = DEFAULT_PROB_OPS)]
+    pub prob_ops: ProbOps,
 
     /// int: number of Freivalds repetitions in probabilistic execution mode
     #[arg(long = "prob-k", default_value_t = DEFAULT_PROB_K_U32)]
     pub prob_k: u32,
 
-    /// str: probabilistic seed mode, accepts `public` (alias `public_seed`) or `fiat_shamir`
+    /// str: probabilistic seed mode, accepts `public_seed` or `fiat_shamir`
     #[arg(long = "prob-seed-mode", default_value_t = DEFAULT_PROB_SEED_MODE)]
     pub prob_seed_mode: ProbSeedMode,
 }
@@ -163,13 +135,13 @@ impl Default for RunArgs {
             rebase_frac_zero_constants: false,
             check_mode: CheckMode::SAFE,
             decomp_base: 128,
-            decomp_legs: 2,
+            decomp_legs: 5,
             bounded_log_lookup: false,
             ignore_range_check_inputs_outputs: false,
             epsilon: None,
             disable_freivalds: false,
             execution_mode: DEFAULT_EXECUTION_MODE,
-            prob_ops: default_prob_ops_vec(),
+            prob_ops: ProbOps::default(),
             prob_k: DEFAULT_PROB_K_U32,
             prob_seed_mode: DEFAULT_PROB_SEED_MODE,
         }

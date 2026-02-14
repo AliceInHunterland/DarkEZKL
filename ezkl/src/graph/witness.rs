@@ -183,7 +183,7 @@ impl GraphWitness {
             GraphError::ReadWriteFileError(path.display().to_string(), e.to_string())
         })?;
 
-        let reader = std::io::BufReader::with_capacity(*EZKL_BUF_CAPACITY, file);
+        let reader = std::io::BufReader::with_capacity(EZKL_BUF_CAPACITY, file);
         let witness: GraphWitness =
             serde_json::from_reader(reader).map_err(Into::<GraphError>::into)?;
 
@@ -199,7 +199,7 @@ impl GraphWitness {
             GraphError::ReadWriteFileError(path.display().to_string(), e.to_string())
         })?;
         // use buf writer
-        let writer = std::io::BufWriter::with_capacity(*EZKL_BUF_CAPACITY, file);
+        let writer = std::io::BufWriter::with_capacity(EZKL_BUF_CAPACITY, file);
 
         serde_json::to_writer(writer, &self).map_err(|e| e.into())
     }

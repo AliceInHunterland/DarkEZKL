@@ -4,14 +4,44 @@
 //! - accept probabilistic execution arguments in `gen_settings` and
 //!   `calibrate_settings` so Python users can opt-in.
 //!
-//! The full EZKL repository typically wires these functions into the
-//! underlying command implementations. In this snapshot we keep behavior
-//! minimal while preserving the *API surface* expected by callers/tests.
+//! In this snapshot we *patch* an existing settings.json. Importantly, we write
+//! settings in a shape compatible with `GraphSettings` (top-level mirrors +
+//! `run_args` mirrors), so a subsequent CLI run can deserialize it.
 
 use std::fs;
 use std::path::Path;
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
+
+fn ensure_object<'a>(v: &'a mut Value, key: &str) -> &'a mut serde_json::Map<String, Value> {
+    if !v.get(key).is_some_and(|x| x.is_object()) {
+        v[key] = json!({});
+    }
+    v[key].as_object_mut().expect("must be object")
+}
+
+fn parse_ops_value(v: &Value) -> Option<Vec<String>> {
+    if let Some(arr) = v.as_array() {
+        let ops = arr
+            .iter()
+            .filter_map(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        return Some(ops);
+    }
+
+    if let Some(s) = v.as_str() {
+        let ops = s
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect::<Vec<_>>();
+        return Some(ops);
+    }
+
+    None
+}
 
 fn update_settings_file(
     settings_path: &Path,
@@ -44,46 +74,127 @@ fn update_settings_file(
         ));
     }
 
-    if let Some(mode) = execution_mode {
-        root["execution_mode"] = Value::String(mode.to_string());
-    }
+    // IMPORTANT (borrow-checker):
+    // We must not keep `&str` references into `root` alive across mutations of `root`.
+    // So we always copy string values out of `root` into owned `String`s here.
+    let existing_mode: String = root
+        .get("execution_mode")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            root.get("run_args")
+                .and_then(|ra| ra.get("execution_mode"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("exact")
+        .to_string();
 
-    // Only update prob_ops if any prob-related knob is provided.
-    let should_update_prob_ops = prob_ops.is_some() || prob_k.is_some() || prob_seed_mode.is_some();
-    if should_update_prob_ops {
-        let k = prob_k.unwrap_or(40);
-        let seed_mode = prob_seed_mode.unwrap_or("public_seed");
+    // (A) execution_mode (top-level + run_args mirror)
+    let final_mode: String = execution_mode
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(existing_mode);
 
-        let ops = prob_ops.unwrap_or_default();
-        let mut ops_norm: Vec<String> = ops
+    let mode_is_prob = final_mode.eq_ignore_ascii_case("probabilistic");
+
+    // Determine whether we should update probabilistic knobs.
+    let should_update_prob =
+        prob_ops.is_some() || prob_k.is_some() || prob_seed_mode.is_some() || mode_is_prob;
+
+    // Pull existing probabilistic settings as fallbacks (owned) so we don't keep borrows into `root`.
+    let existing_k: Option<u32> = root
+        .get("prob_k")
+        .and_then(Value::as_u64)
+        .and_then(|x| u32::try_from(x).ok())
+        .or_else(|| {
+            root.get("probabilistic_settings")
+                .and_then(|ps| ps.get("k_repetitions"))
+                .and_then(Value::as_u64)
+                .and_then(|x| u32::try_from(x).ok())
+        })
+        .or_else(|| {
+            root.get("run_args")
+                .and_then(|ra| ra.get("prob_k"))
+                .and_then(Value::as_u64)
+                .and_then(|x| u32::try_from(x).ok())
+        });
+
+    let existing_seed_mode: Option<String> = root
+        .get("probabilistic_settings")
+        .and_then(|ps| ps.get("seed_mode"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .or_else(|| {
+            root.get("run_args")
+                .and_then(|ra| ra.get("prob_seed_mode"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_string())
+        });
+
+    let existing_ops: Option<Vec<String>> = root
+        .get("prob_ops")
+        .and_then(parse_ops_value)
+        .or_else(|| {
+            root.get("run_args")
+                .and_then(|ra| ra.get("prob_ops"))
+                .and_then(parse_ops_value)
+        });
+
+    // Update top-level execution_mode mirror.
+    root["execution_mode"] = Value::String(final_mode.clone());
+
+    // (B) probabilistic knobs (top-level + run_args mirrors)
+    // Keep the previous behavior: if the caller asks for *any* prob settings (or sets
+    // probabilistic mode), make sure the prob fields exist (with sensible defaults).
+    let (k_final, seed_mode_final, ops_final) = if should_update_prob {
+        let k = prob_k.or(existing_k).unwrap_or(40);
+
+        let seed_mode = prob_seed_mode
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or(existing_seed_mode)
+            .unwrap_or_else(|| "public_seed".to_string());
+
+        let mut ops = prob_ops.or(existing_ops).unwrap_or_default();
+        ops = ops
             .into_iter()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .collect();
+            .collect::<Vec<_>>();
 
-        // If user asked for probabilistic mode but didn't specify ops, pick a reasonable default.
-        let mode_is_prob = root
-            .get("execution_mode")
-            .and_then(|v| v.as_str())
-            .map(|s| s == "probabilistic")
-            .unwrap_or(false);
-
-        if ops_norm.is_empty() && mode_is_prob {
-            ops_norm = vec!["MatMul".into(), "Gemm".into(), "Conv".into()];
+        // Reasonable defaults if the caller enabled probabilistic mode but didn't specify ops.
+        if ops.is_empty() && mode_is_prob {
+            ops = vec!["MatMul".into(), "Gemm".into(), "Conv".into()];
         }
 
-        let mut prob_ops_obj = Map::<String, Value>::new();
-        for op in ops_norm {
-            prob_ops_obj.insert(
-                op,
-                json!({
-                    "k_repetitions": k,
-                    "challenge_seed_mode": seed_mode,
-                }),
-            );
-        }
+        // Top-level mirrors (auditable).
+        root["prob_k"] = json!(k);
+        root["prob_ops"] = json!(ops.clone());
+        root["probabilistic_settings"] = json!({
+            "k_repetitions": k,
+            "seed_mode": seed_mode.clone(),
+        });
 
-        root["prob_ops"] = Value::Object(prob_ops_obj);
+        (Some(k), Some(seed_mode), Some(ops))
+    } else {
+        (None, None, None)
+    };
+
+    // Update run_args mirror in a tight scope so we don't keep a long-lived &mut borrow of `root`.
+    {
+        let run_args = ensure_object(&mut root, "run_args");
+
+        run_args.insert("execution_mode".into(), Value::String(final_mode.clone()));
+
+        if should_update_prob {
+            let k = k_final.expect("k_final must be Some when should_update_prob");
+            let seed_mode =
+                seed_mode_final.expect("seed_mode_final must be Some when should_update_prob");
+            let ops = ops_final.expect("ops_final must be Some when should_update_prob");
+
+            run_args.insert("prob_k".into(), json!(k));
+            run_args.insert("prob_seed_mode".into(), json!(seed_mode));
+            run_args.insert("prob_ops".into(), json!(ops));
+        }
     }
 
     let bytes = serde_json::to_vec_pretty(&root)
@@ -129,7 +240,10 @@ mod pyo3_bindings {
         }
     }
 
-    fn get_kwarg_ops(kwargs: Option<&Bound<'_, PyDict>>, key: &str) -> PyResult<Option<Vec<String>>> {
+    fn get_kwarg_ops(
+        kwargs: Option<&Bound<'_, PyDict>>,
+        key: &str,
+    ) -> PyResult<Option<Vec<String>>> {
         let Some(kwargs) = kwargs else {
             return Ok(None);
         };
@@ -184,12 +298,12 @@ mod pyo3_bindings {
     }
 
     /// Python: gen_settings(..., execution_mode=..., prob_ops=..., prob_k=..., prob_seed_mode=...)
-    ///
-    /// We intentionally accept `*args, **kwargs` to remain flexible in this kata snapshot.
-    /// The Step 2 requirement is that Python users can pass the new probabilistic args.
     #[pyfunction]
     #[pyo3(signature = (*args, **kwargs))]
-    pub fn gen_settings(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+    pub fn gen_settings(
+        args: &Bound<'_, PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
         let settings_path = settings_path_from_args_or_kwargs(args, kwargs)?;
 
         let execution_mode = get_kwarg_string(kwargs, "execution_mode")?;
@@ -250,8 +364,6 @@ mod pyo3_bindings {
 pub use pyo3_bindings::{calibrate_settings, gen_settings, register};
 
 /// Non-Python builds: keep the module compiling without pyo3.
-///
-/// (Callers that depend on Python bindings should enable the `python` feature.)
 #[cfg(not(feature = "python-bindings"))]
 pub fn gen_settings(
     _settings_path: &str,

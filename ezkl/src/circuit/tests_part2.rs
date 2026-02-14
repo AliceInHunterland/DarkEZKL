@@ -12,7 +12,9 @@ mod conv_col_ultra_overflow {
             multiopen::{ProverSHPLONK, VerifierSHPLONK},
         },
     };
-    use snark_verifier::system::halo2::transcript::evm::EvmTranscript;
+    use halo2_proofs::transcript::{Blake2bWrite, Blake2bRead, Challenge255};
+    use halo2curves::bn256::G1Affine;
+    use std::io::Cursor;
 
     use super::*;
 
@@ -124,9 +126,9 @@ mod conv_col_ultra_overflow {
             ProverSHPLONK<_>,
             VerifierSHPLONK<_>,
             SingleStrategy<_>,
-            _,
-            EvmTranscript<_, _, _, _>,
-            EvmTranscript<_, _, _, _>,
+            Challenge255<G1Affine>,
+            Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
+            Blake2bRead<Cursor<Vec<u8>>, G1Affine, Challenge255<G1Affine>>,
         >(
             circuit.clone(),
             vec![],
@@ -155,7 +157,9 @@ mod conv_relu_col_ultra_overflow {
         multiopen::{ProverSHPLONK, VerifierSHPLONK},
         strategy::SingleStrategy,
     };
-    use snark_verifier::system::halo2::transcript::evm::EvmTranscript;
+    use halo2_proofs::transcript::{Blake2bWrite, Blake2bRead, Challenge255};
+    use halo2curves::bn256::G1Affine;
+    use std::io::Cursor;
 
     use super::*;
 
@@ -292,9 +296,9 @@ mod conv_relu_col_ultra_overflow {
             ProverSHPLONK<_>,
             VerifierSHPLONK<_>,
             SingleStrategy<_>,
-            _,
-            EvmTranscript<_, _, _, _>,
-            EvmTranscript<_, _, _, _>,
+            Challenge255<G1Affine>,
+            Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
+            Blake2bRead<Cursor<Vec<u8>>, G1Affine, Challenge255<G1Affine>>,
         >(
             circuit.clone(),
             vec![],
@@ -1372,7 +1376,9 @@ mod lookup_ultra_overflow {
             strategy::SingleStrategy,
         },
     };
-    use snark_verifier::system::halo2::transcript::evm::EvmTranscript;
+    use halo2_proofs::transcript::{Blake2bWrite, Blake2bRead, Challenge255};
+    use halo2curves::bn256::G1Affine;
+    use std::io::Cursor;
 
     #[derive(Clone)]
     struct SigmoidCircuit<F: PrimeField + TensorType + PartialOrd> {
@@ -1465,9 +1471,9 @@ mod lookup_ultra_overflow {
             ProverSHPLONK<_>,
             VerifierSHPLONK<_>,
             SingleStrategy<_>,
-            _,
-            EvmTranscript<_, _, _, _>,
-            EvmTranscript<_, _, _, _>,
+            Challenge255<G1Affine>,
+            Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
+            Blake2bRead<Cursor<Vec<u8>>, G1Affine, Challenge255<G1Affine>>,
         >(
             circuit.clone(),
             vec![],

@@ -167,7 +167,7 @@ impl RegionSettings {
             execution_mode: ExecutionMode::Exact,
             prob_ops: DEFAULT_PROB_OPS.iter().map(|s| s.to_string()).collect(),
             prob_k: DEFAULT_PROB_K,
-            prob_seed_mode: ProbSeedMode::Public,
+            prob_seed_mode: ProbSeedMode::PublicSeed,
         }
     }
 
@@ -181,7 +181,7 @@ impl RegionSettings {
             execution_mode: ExecutionMode::Exact,
             prob_ops: DEFAULT_PROB_OPS.iter().map(|s| s.to_string()).collect(),
             prob_k: DEFAULT_PROB_K,
-            prob_seed_mode: ProbSeedMode::Public,
+            prob_seed_mode: ProbSeedMode::PublicSeed,
         }
     }
 
@@ -195,7 +195,7 @@ impl RegionSettings {
             execution_mode: ExecutionMode::Exact,
             prob_ops: DEFAULT_PROB_OPS.iter().map(|s| s.to_string()).collect(),
             prob_k: DEFAULT_PROB_K,
-            prob_seed_mode: ProbSeedMode::Public,
+            prob_seed_mode: ProbSeedMode::PublicSeed,
         }
     }
 }

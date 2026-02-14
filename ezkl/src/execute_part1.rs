@@ -1,10 +1,7 @@
 use crate::circuit::region::RegionSettings;
+use bytes::Bytes;
 use crate::circuit::CheckMode;
-use crate::commands::CalibrationTarget;
-#[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-use crate::eth::deploy_contract_via_solidity;
-#[cfg(all(feature = "reusable-verifier", not(target_arch = "wasm32")))]
-use crate::eth::register_vka_via_rv;
+use crate::CalibrationTarget;
 #[allow(unused_imports)]
 #[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
 use crate::eth::{get_contract_artifacts, verify_proof_via_solidity};
@@ -14,18 +11,14 @@ use crate::pfsys::{
     create_keys, load_pk, load_vk, save_params, save_pk, swap_proof_commitments, Snark,
 };
 use crate::pfsys::{create_proof_circuit, verify_proof_circuit, ProofSplitCommit};
-use crate::pfsys::{encode_calldata, save_vk, srs::*};
-use crate::tensor::TensorError;
+use crate::pfsys::{save_vk, srs::*};
 use crate::RunArgs;
 use crate::EZKL_BUF_CAPACITY;
 use crate::{commands::*, EZKLError};
-use colored::Colorize;
-#[cfg(unix)]
-use gag::Gag;
 use halo2_proofs::dev::VerifyFailure;
 #[cfg(feature = "gpu-accelerated")]
 use halo2_proofs::icicle::try_load_and_set_backend_device;
-use halo2_proofs::plonk::{self, Circuit};
+use halo2_proofs::plonk::Circuit;
 use halo2_proofs::poly::commitment::Verifier;
 use halo2_proofs::poly::commitment::{CommitmentScheme, Params};
 
@@ -35,9 +28,9 @@ use halo2_proofs::poly::kzg::{
     commitment::ParamsKZG, strategy::SingleStrategy as KZGSingleStrategy,
 };
 use halo2_proofs::poly::VerificationStrategy;
-use halo2_proofs::transcript::{EncodedChallenge, TranscriptReadBuffer};
-#[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-use halo2_solidity_verifier;
+use halo2_proofs::transcript::{
+    Blake2bRead, Blake2bWrite, Challenge255, EncodedChallenge, TranscriptReadBuffer,
+};
 use halo2curves::bn256::{Bn256, Fr, G1Affine};
 use halo2curves::ff::{FromUniformBytes, WithSmallOrderMulGroup};
 use halo2curves::serde::SerdeObject;
@@ -51,17 +44,13 @@ use log::debug;
 use log::{info, trace, warn};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use snark_verifier::system::halo2::transcript::evm::EvmTranscript;
-#[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-use std::fs::File;
 use std::io::BufWriter;
 use std::io::Cursor;
-#[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
+use std::io::IsTerminal;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
-use tabled::Tabled;
 use thiserror::Error;
 use tract_onnx::prelude::IntoTensor;
 use tract_onnx::prelude::Tensor as TractTensor;
@@ -131,14 +120,14 @@ pub async fn run(command: Commands) -> Result<String, EZKLError> {
             settings_path,
             logrows,
         } => get_srs_cmd(srs_path, settings_path, logrows).await,
-        Commands::Table { model, args } => table(model.unwrap_or(DEFAULT_MODEL.into()), args),
+        Commands::Table { model, args } => table(model.unwrap_or(crate::DEFAULT_MODEL.into()), args),
         Commands::GenSettings {
             model,
             settings_path,
             args,
         } => gen_circuit_settings(
-            model.unwrap_or(DEFAULT_MODEL.into()),
-            settings_path.unwrap_or(DEFAULT_SETTINGS.into()),
+            model.unwrap_or(crate::DEFAULT_MODEL.into()),
+            settings_path.unwrap_or(crate::DEFAULT_SETTINGS.into()),
             args,
         ),
         Commands::GenRandomData {
@@ -149,8 +138,8 @@ pub async fn run(command: Commands) -> Result<String, EZKLError> {
             min,
             max,
         } => gen_random_data(
-            model.unwrap_or(DEFAULT_MODEL.into()),
-            data.unwrap_or(DEFAULT_DATA.into()),
+            model.unwrap_or(crate::DEFAULT_MODEL.into()),
+            data.unwrap_or(crate::DEFAULT_DATA.into()),
             variables,
             seed,
             min,
@@ -166,9 +155,9 @@ pub async fn run(command: Commands) -> Result<String, EZKLError> {
             scale_rebase_multiplier,
             max_logrows,
         } => calibrate(
-            model.unwrap_or(DEFAULT_MODEL.into()),
-            data.unwrap_or(DEFAULT_DATA.into()),
-            settings_path.unwrap_or(DEFAULT_SETTINGS.into()),
+            model.unwrap_or(crate::DEFAULT_MODEL.into()),
+            data.unwrap_or(crate::DEFAULT_DATA.into()),
+            settings_path.unwrap_or(crate::DEFAULT_SETTINGS.into()),
             target,
             lookup_safety_margin,
             scales,
@@ -183,77 +172,26 @@ pub async fn run(command: Commands) -> Result<String, EZKLError> {
             vk_path,
             srs_path,
         } => gen_witness(
-            compiled_circuit.unwrap_or(DEFAULT_COMPILED_CIRCUIT.into()),
-            data.unwrap_or(DataField(DEFAULT_DATA.into())).to_string(),
-            Some(output.unwrap_or(DEFAULT_WITNESS.into())),
+            compiled_circuit.unwrap_or(crate::DEFAULT_COMPILED_CIRCUIT.into()),
+            data.unwrap_or(DataField(crate::DEFAULT_DATA.into())).to_string(),
+            Some(output.unwrap_or(crate::DEFAULT_WITNESS.into())),
             vk_path,
             srs_path,
         )
         .map(|e| serde_json::to_string(&e).unwrap()),
         Commands::Mock { model, witness } => mock(
-            model.unwrap_or(DEFAULT_MODEL.into()),
-            witness.unwrap_or(DEFAULT_WITNESS.into()),
+            model.unwrap_or(crate::DEFAULT_MODEL.into()),
+            witness.unwrap_or(crate::DEFAULT_WITNESS.into()),
         ),
-        #[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-        Commands::CreateEvmVerifier {
-            vk_path,
-            srs_path,
-            settings_path,
-            sol_code_path,
-            abi_path,
-            reusable,
-        } => {
-            create_evm_verifier(
-                vk_path.unwrap_or(DEFAULT_VK.into()),
-                srs_path,
-                settings_path.unwrap_or(DEFAULT_SETTINGS.into()),
-                sol_code_path.unwrap_or(DEFAULT_SOL_CODE.into()),
-                abi_path.unwrap_or(DEFAULT_VERIFIER_ABI.into()),
-                reusable.unwrap_or(DEFAULT_RENDER_REUSABLE.parse().unwrap()),
-            )
-            .await
-        }
-        #[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-        Commands::EncodeEvmCalldata {
-            proof_path,
-            calldata_path,
-            vka_path,
-        } => encode_evm_calldata(
-            proof_path.unwrap_or(DEFAULT_PROOF.into()),
-            calldata_path.unwrap_or(DEFAULT_CALLDATA.into()),
-            vka_path,
-        )
-        .map(|e| serde_json::to_string(&e).unwrap()),
-        #[cfg(all(
-            feature = "eth",
-            feature = "reusable-verifier",
-            not(target_arch = "wasm32")
-        ))]
-        Commands::CreateEvmVka {
-            vk_path,
-            srs_path,
-            settings_path,
-            vka_path,
-            decimals,
-        } => {
-            create_evm_vka(
-                vk_path.unwrap_or(DEFAULT_VK.into()),
-                srs_path,
-                settings_path.unwrap_or(DEFAULT_SETTINGS.into()),
-                vka_path.unwrap_or(DEFAULT_VKA.into()),
-                decimals.unwrap_or(DEFAULT_DECIMALS.parse().unwrap()),
-            )
-            .await
-        }
 
         Commands::CompileCircuit {
             model,
             compiled_circuit,
             settings_path,
         } => compile_circuit(
-            model.unwrap_or(DEFAULT_MODEL.into()),
-            compiled_circuit.unwrap_or(DEFAULT_COMPILED_CIRCUIT.into()),
-            settings_path.unwrap_or(DEFAULT_SETTINGS.into()),
+            model.unwrap_or(crate::DEFAULT_MODEL.into()),
+            compiled_circuit.unwrap_or(crate::DEFAULT_COMPILED_CIRCUIT.into()),
+            settings_path.unwrap_or(crate::DEFAULT_SETTINGS.into()),
         ),
         Commands::Setup {
             compiled_circuit,
@@ -263,20 +201,20 @@ pub async fn run(command: Commands) -> Result<String, EZKLError> {
             witness,
             disable_selector_compression,
         } => setup(
-            compiled_circuit.unwrap_or(DEFAULT_COMPILED_CIRCUIT.into()),
+            compiled_circuit.unwrap_or(crate::DEFAULT_COMPILED_CIRCUIT.into()),
             srs_path,
-            vk_path.unwrap_or(DEFAULT_VK.into()),
-            pk_path.unwrap_or(DEFAULT_PK.into()),
+            vk_path.unwrap_or(crate::DEFAULT_VK.into()),
+            pk_path.unwrap_or(crate::DEFAULT_PK.into()),
             witness,
             disable_selector_compression
-                .unwrap_or(DEFAULT_DISABLE_SELECTOR_COMPRESSION.parse().unwrap()),
+                .unwrap_or(crate::DEFAULT_DISABLE_SELECTOR_COMPRESSION.parse().unwrap()),
         ),
         Commands::SwapProofCommitments {
             proof_path,
             witness_path,
         } => swap_proof_commitments_cmd(
-            proof_path.unwrap_or(DEFAULT_PROOF.into()),
-            witness_path.unwrap_or(DEFAULT_WITNESS.into()),
+            proof_path.unwrap_or(crate::DEFAULT_PROOF.into()),
+            witness_path.unwrap_or(crate::DEFAULT_WITNESS.into()),
         )
         .map(|e| serde_json::to_string(&e).unwrap()),
 
@@ -288,12 +226,12 @@ pub async fn run(command: Commands) -> Result<String, EZKLError> {
             srs_path,
             check_mode,
         } => prove(
-            witness.unwrap_or(DEFAULT_WITNESS.into()),
-            compiled_circuit.unwrap_or(DEFAULT_COMPILED_CIRCUIT.into()),
-            pk_path.unwrap_or(DEFAULT_PK.into()),
-            Some(proof_path.unwrap_or(DEFAULT_PROOF.into())),
+            witness.unwrap_or(crate::DEFAULT_WITNESS.into()),
+            compiled_circuit.unwrap_or(crate::DEFAULT_COMPILED_CIRCUIT.into()),
+            pk_path.unwrap_or(crate::DEFAULT_PK.into()),
+            Some(proof_path.unwrap_or(crate::DEFAULT_PROOF.into())),
             srs_path,
-            check_mode.unwrap_or(DEFAULT_CHECKMODE.parse().unwrap()),
+            check_mode.unwrap_or(crate::DEFAULT_CHECKMODE.parse().unwrap()),
         )
         .map(|e| serde_json::to_string(&e).unwrap()),
         Commands::Verify {
@@ -303,70 +241,13 @@ pub async fn run(command: Commands) -> Result<String, EZKLError> {
             srs_path,
             reduced_srs,
         } => verify(
-            proof_path.unwrap_or(DEFAULT_PROOF.into()),
-            settings_path.unwrap_or(DEFAULT_SETTINGS.into()),
-            vk_path.unwrap_or(DEFAULT_VK.into()),
+            proof_path.unwrap_or(crate::DEFAULT_PROOF.into()),
+            settings_path.unwrap_or(crate::DEFAULT_SETTINGS.into()),
+            vk_path.unwrap_or(crate::DEFAULT_VK.into()),
             srs_path,
-            reduced_srs.unwrap_or(DEFAULT_USE_REDUCED_SRS_FOR_VERIFICATION.parse().unwrap()),
+            reduced_srs.unwrap_or(crate::DEFAULT_USE_REDUCED_SRS_FOR_VERIFICATION.parse().unwrap()),
         )
         .map(|e| serde_json::to_string(&e).unwrap()),
-        #[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-        Commands::DeployEvm {
-            sol_code_path,
-            rpc_url,
-            addr_path,
-            optimizer_runs,
-            private_key,
-            #[cfg(all(feature = "reusable-verifier", not(target_arch = "wasm32")))]
-            contract,
-        } => {
-            deploy_evm(
-                sol_code_path.unwrap_or(DEFAULT_SOL_CODE.into()),
-                rpc_url,
-                addr_path.unwrap_or(DEFAULT_CONTRACT_ADDRESS.into()),
-                optimizer_runs,
-                private_key,
-                #[cfg(all(feature = "reusable-verifier", not(target_arch = "wasm32")))]
-                contract,
-                #[cfg(not(all(feature = "reusable-verifier", not(target_arch = "wasm32"))))]
-                ContractType::default(),
-            )
-            .await
-        }
-        #[cfg(all(feature = "eth", not(target_arch = "wasm32")))]
-        Commands::VerifyEvm {
-            proof_path,
-            addr_verifier,
-            rpc_url,
-            vka_path,
-            encoded_calldata,
-        } => {
-            verify_evm(
-                proof_path.unwrap_or(DEFAULT_PROOF.into()),
-                addr_verifier,
-                rpc_url,
-                vka_path,
-                encoded_calldata,
-            )
-            .await
-        }
-        #[cfg(feature = "reusable-verifier")]
-        Commands::RegisterVka {
-            addr_verifier,
-            vka_path,
-            rpc_url,
-            vka_digest_path,
-            private_key,
-        } => {
-            register_vka(
-                rpc_url,
-                addr_verifier,
-                vka_path.unwrap_or(DEFAULT_VKA.into()),
-                vka_digest_path.unwrap_or(DEFAULT_VKA_DIGEST.into()),
-                private_key,
-            )
-            .await
-        }
         #[cfg(not(feature = "no-update"))]
         Commands::Update { version } => update_ezkl_binary(&version).map(|e| e.to_string()),
     }
@@ -377,15 +258,15 @@ pub async fn run(command: Commands) -> Result<String, EZKLError> {
 fn assert_version_is_valid(version: &str) -> Result<(), EZKLError> {
     let err_string = "Invalid version string. Must be in the format v0.0.0";
     if version.is_empty() {
-        return Err(err_string.into());
+        return Err(EZKLError::msg(err_string));
     }
     // safe to unwrap since we know the length is not 0
     if !version.starts_with('v') {
-        return Err(err_string.into());
+        return Err(EZKLError::msg(err_string));
     }
 
     semver::Version::parse(&version[1..])
-        .map_err(|_| "Invalid version string. Must be in the format v0.0.0")?;
+        .map_err(|_| EZKLError::msg("Invalid version string. Must be in the format v0.0.0"))?;
 
     Ok(())
 }
@@ -426,12 +307,11 @@ fn update_ezkl_binary(version: &Option<String>) -> Result<String, EZKLError> {
         info!("updated binary");
         Ok("".to_string())
     } else {
-        Err(format!(
+        Err(EZKLError::msg(format!(
             "failed to update binary: {}, {}",
             std::str::from_utf8(&output.stdout)?,
             std::str::from_utf8(&output.stderr)?
-        )
-        .into())
+        )))
     }
 }
 
@@ -447,72 +327,308 @@ pub fn get_srs_path(logrows: u32, srs_path: Option<PathBuf>) -> PathBuf {
     }
 }
 
-fn srs_exists_check(logrows: u32, srs_path: Option<PathBuf>) -> bool {
-    Path::new(&get_srs_path(logrows, srs_path)).exists()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SrsSource {
+    /// Only accept a public trusted-setup SRS (download + hash check).
+    Public,
+    /// Try `Public`, but fall back to `Dummy` on download/validation failures.
+    Auto,
+    /// Always generate a local (DUMMY) SRS (benchmarking only; insecure for production).
+    Dummy,
+}
+
+impl SrsSource {
+    fn from_env() -> Self {
+        let raw = std::env::var("EZKL_SRS_SOURCE").unwrap_or_default();
+        match raw.trim().to_lowercase().as_str() {
+            "" | "public" | "download" => SrsSource::Public,
+            "auto" => SrsSource::Auto,
+            "dummy" | "local" | "gen" | "generate" => SrsSource::Dummy,
+            other => {
+                warn!(
+                    "Unknown EZKL_SRS_SOURCE='{}' (expected public|auto|dummy); defaulting to 'public'",
+                    other
+                );
+                SrsSource::Public
+            }
+        }
+    }
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<(), EZKLError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
+fn srs_dummy_marker_path(srs_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.dummy", srs_path.display()))
+}
+
+fn is_marked_dummy(srs_path: &Path) -> bool {
+    srs_dummy_marker_path(srs_path).exists()
+}
+
+fn mark_srs_as_dummy(srs_path: &Path) -> Result<(), EZKLError> {
+    let marker = srs_dummy_marker_path(srs_path);
+    ensure_parent_dir(&marker)?;
+    std::fs::write(
+        marker,
+        b"dummy srs: generated locally by ezkl (NOT from a public trusted setup)\n",
+    )?;
+    Ok(())
+}
+
+fn clear_dummy_marker(srs_path: &Path) -> Result<(), EZKLError> {
+    let marker = srs_dummy_marker_path(srs_path);
+    if marker.exists() {
+        std::fs::remove_file(marker)?;
+    }
+    Ok(())
+}
+
+fn copy_srs_and_marker(from: &Path, to: &Path) -> Result<(), EZKLError> {
+    if from == to {
+        return Ok(());
+    }
+
+    ensure_parent_dir(to)?;
+
+    // Prefer hard-link to avoid multi-GB copies (common in Docker bind-mount setups).
+    // If it fails (e.g., cross-device), fall back to a real copy.
+    if !to.exists() {
+        if let Err(link_err) = std::fs::hard_link(from, to) {
+            // Fall back to copy (EXDEV is common when crossing filesystems/mounts).
+            std::fs::copy(from, to).map_err(|copy_err| {
+                EZKLError::msg(format!(
+                    "failed to hard-link SRS {} -> {}: {}; and failed to copy: {}",
+                    from.display(),
+                    to.display(),
+                    link_err,
+                    copy_err
+                ))
+            })?;
+        }
+    }
+
+    // Carry dummy marker along (if present).
+    if is_marked_dummy(from) {
+        mark_srs_as_dummy(to)?;
+    } else {
+        clear_dummy_marker(to)?;
+    }
+
+    Ok(())
 }
 
 pub(crate) fn gen_srs_cmd(srs_path: PathBuf, logrows: u32) -> Result<String, EZKLError> {
+    ensure_parent_dir(&srs_path)?;
     let params = gen_srs::<KZGCommitmentScheme<Bn256>>(logrows);
     save_params::<KZGCommitmentScheme<Bn256>>(&srs_path, &params)?;
     Ok(String::new())
 }
 
-async fn fetch_srs(uri: &str) -> Result<Vec<u8>, EZKLError> {
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn mib(x: u64) -> f64 {
+    (x as f64) / (1024.0 * 1024.0)
+}
+
+async fn download_srs_to_file(uri: &str, out_path: &Path) -> Result<(), EZKLError> {
     let pb = {
         let pb = init_spinner();
-        pb.set_message("Downloading SRS (this may take a while) ...");
+        pb.set_message(format!(
+            "Downloading SRS (this may take a while) ... ({uri} -> {})",
+            out_path.display()
+        ));
         pb
     };
-    let client = reqwest::Client::new();
-    // wasm doesn't require it to be mutable
+
+    let connect_timeout_s = env_u64("EZKL_SRS_CONNECT_TIMEOUT_SECS", 15);
+    let stall_timeout_s = env_u64("EZKL_SRS_STALL_TIMEOUT_SECS", 60);
+    let progress_every_s = env_u64("EZKL_SRS_PROGRESS_EVERY_SECS", 30);
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(connect_timeout_s))
+        .build()?;
+
+    // NOTE: Some hosts/WAFs block non-browser user agents. Setting a conservative UA helps.
     #[allow(unused_mut)]
-    let mut resp = client.get(uri).body(vec![]).send().await?;
-    let mut buf = vec![];
-    while let Some(chunk) = resp.chunk().await? {
-        buf.extend(chunk.to_vec());
+    let mut resp = client
+        .get(uri)
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (X11; Linux x86_64) dark-ezkl/bench (reqwest)",
+        )
+        .body(vec![])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.bytes().await.unwrap_or_default();
+        let snippet_len = std::cmp::min(2048, body.len());
+        let snippet = String::from_utf8_lossy(&body[..snippet_len]);
+        pb.finish_and_clear();
+
+        return Err(EZKLError::msg(format!(
+            "failed to download SRS from {uri} (HTTP {status}).\n\
+             Hint: set EZKL_SRS_SOURCE=auto (fallback to dummy) or EZKL_SRS_SOURCE=dummy (no download).\n\
+             Response body (first {snippet_len} bytes):\n{snippet}"
+        )));
     }
 
+    ensure_parent_dir(out_path)?;
+    
+    // Immediately report that download is starting
+    eprintln!("[get-srs] streaming download from {uri} to {}", out_path.display());
+
+    // Stream body to disk (avoid buffering multi-GB SRS in RAM).
+    let file = std::fs::File::create(out_path)?;
+    let mut writer = BufWriter::with_capacity(EZKL_BUF_CAPACITY, file);
+
+    let total = resp.content_length();
+    let start = Instant::now();
+    let mut downloaded: u64 = 0;
+    let mut last_report = Instant::now();
+    
+    // Report initial state
+    if let Some(t) = total {
+        eprintln!("[get-srs] starting download: {:.1} MiB total", mib(t));
+    } else {
+        eprintln!("[get-srs] starting download: size unknown");
+    }
+
+    loop {
+        let next: Result<Option<Bytes>, reqwest::Error> = tokio::time::timeout(
+            Duration::from_secs(stall_timeout_s),
+            resp.chunk(),
+        )
+        .await
+        .map_err(|_| {
+            pb.finish_and_clear();
+            EZKLError::msg(format!(
+                "SRS download stalled for >= {stall_timeout_s}s from {uri}.\n\
+                 Hint: set EZKL_SRS_SOURCE=dummy to skip download."
+            ))
+        })?;
+
+        let Some(chunk) = next? else {
+            break;
+        };
+
+        writer.write_all(&chunk)?;
+        downloaded += chunk.len() as u64;
+
+        if last_report.elapsed() >= Duration::from_secs(progress_every_s) {
+            if let Some(t) = total {
+                eprintln!(
+                    "[get-srs] downloaded {:.1}/{:.1} MiB ({:.1}%) in {:.0}s",
+                    mib(downloaded),
+                    mib(t),
+                    (downloaded as f64 * 100.0) / (t as f64),
+                    start.elapsed().as_secs_f64()
+                );
+            } else {
+                eprintln!(
+                    "[get-srs] downloaded {:.1} MiB in {:.0}s",
+                    mib(downloaded),
+                    start.elapsed().as_secs_f64()
+                );
+            }
+            last_report = Instant::now();
+        }
+    }
+
+    writer.flush()?;
     pb.finish_with_message("SRS downloaded.");
-    Ok(std::mem::take(&mut buf))
+    Ok(())
 }
 
 pub(crate) fn get_file_hash(path: &PathBuf) -> Result<String, EZKLError> {
-    use std::io::Read;
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut buffer = vec![];
-    let bytes_read = reader.read_to_end(&mut buffer)?;
-    info!(
-        "read {} bytes from file (vector of len = {})",
-        bytes_read,
-        buffer.len()
-    );
-
-    let hash = sha256::digest(buffer);
+    // Streaming hash (do not read multi-GB files into RAM).
+    let hash = sha256::try_digest(path.as_path()).map_err(|e| {
+        EZKLError::msg(format!(
+            "failed to compute sha256 of {}: {e}",
+            path.display()
+        ))
+    })?;
     info!("file hash: {}", hash);
 
     Ok(hash)
 }
 
-fn check_srs_hash(logrows: u32, srs_path: Option<PathBuf>) -> Result<String, EZKLError> {
-    let path = get_srs_path(logrows, srs_path);
-    let hash = get_file_hash(&path)?;
+fn enforce_public_srs_hash(logrows: u32, path: &PathBuf) -> Result<String, EZKLError> {
+    if is_marked_dummy(path.as_path()) {
+        return Err(EZKLError::msg(format!(
+            "SRS at {} is marked as DUMMY ({} exists).\n\
+             Refusing to treat it as a public trusted-setup SRS.\n\
+             Delete it or set EZKL_SRS_SOURCE=auto|dummy.",
+            path.display(),
+            srs_dummy_marker_path(path.as_path()).display(),
+        )));
+    }
+
+    let hash = get_file_hash(path)?;
 
     let predefined_hash = match crate::srs_sha::PUBLIC_SRS_SHA256_HASHES.get(&logrows) {
         Some(h) => h,
-        None => return Err(format!("SRS (k={}) hash not found in public set", logrows).into()),
+        None => {
+            return Err(EZKLError::msg(format!(
+                "SRS (k={}) hash not found in public set",
+                logrows
+            )))
+        }
     };
 
     if hash != *predefined_hash {
-        // delete file
         warn!("removing SRS file at {}", path.display());
         std::fs::remove_file(path)?;
-        return Err(
-            "SRS hash does not match the expected hash. Remote SRS may have been tampered with."
-                .into(),
+        // best-effort: also remove marker if it exists
+        let _ = clear_dummy_marker(path.as_path());
+
+        return Err(EZKLError::msg(
+            "SRS hash does not match the expected hash. Remote SRS may have been tampered with.",
+        ));
+    }
+
+    Ok(hash)
+}
+
+fn warn_if_public_srs_hash_mismatch(logrows: u32, path: &PathBuf) -> Result<(), EZKLError> {
+    if is_marked_dummy(path.as_path()) {
+        warn!(
+            "SRS at {} is marked as DUMMY ({} exists); skipping public hash check.",
+            path.display(),
+            srs_dummy_marker_path(path.as_path()).display(),
+        );
+        return Ok(());
+    }
+
+    let Some(expected) = crate::srs_sha::PUBLIC_SRS_SHA256_HASHES.get(&logrows) else {
+        warn!(
+            "No expected public SRS hash known for k={}; skipping hash check.",
+            logrows
+        );
+        return Ok(());
+    };
+
+    let actual = get_file_hash(path)?;
+    if actual != *expected {
+        warn!(
+            "SRS hash mismatch for k={}: expected {}, got {}. Proceeding anyway (non-strict mode).",
+            logrows, expected, actual
         );
     }
-    Ok(hash)
+    Ok(())
 }
 
 pub(crate) async fn get_srs_cmd(
@@ -531,40 +647,163 @@ pub(crate) async fn get_srs_cmd(
             let settings = GraphSettings::load(settings_p)?;
             settings.run_args.logrows
         } else {
-            return Err(err_string.into());
+            return Err(EZKLError::msg(err_string));
         }
     } else {
-        return Err(err_string.into());
+        return Err(EZKLError::msg(err_string));
     };
 
-    if !srs_exists_check(k, srs_path.clone()) {
-        info!("SRS does not exist, downloading...");
-        let srs_uri = format!("{}{}", PUBLIC_SRS_URL, k);
-        let mut reader = Cursor::new(fetch_srs(&srs_uri).await?);
-        // check the SRS
-        let pb = init_spinner();
-        pb.set_message("Validating SRS (this may take a while) ...");
-        let params = ParamsKZG::<Bn256>::read(&mut reader)?;
-        pb.finish_with_message("SRS validated.");
+    let srs_source = SrsSource::from_env();
 
-        info!("Saving SRS to disk...");
-        let computed_srs_path = get_srs_path(k, srs_path.clone());
-        let mut file = std::fs::File::create(&computed_srs_path)?;
-        let mut buffer = BufWriter::with_capacity(*EZKL_BUF_CAPACITY, &mut file);
-        params.write(&mut buffer)?;
+    // Always use global cache (~/.ezkl/srs) as the canonical storage, and copy to the
+    // user-requested `--srs-path` if provided.
+    let cache_path = get_srs_path(k, None);
+    let out_path = get_srs_path(k, srs_path.clone());
+
+    let ensure_out_from_cache = || -> Result<(), EZKLError> {
+        if out_path == cache_path {
+            return Ok(());
+        }
+        if Path::new(&out_path).exists() {
+            return Ok(());
+        }
+        if !Path::new(&cache_path).exists() {
+            return Err(EZKLError::msg(format!(
+                "internal error: cache_path {} does not exist after SRS creation",
+                cache_path.display()
+            )));
+        }
 
         info!(
-            "Saved SRS to {}.",
-            computed_srs_path.as_os_str().to_str().unwrap_or("disk")
+            "Materializing SRS {} from cache {}",
+            out_path.display(),
+            cache_path.display()
+        );
+        copy_srs_and_marker(cache_path.as_path(), out_path.as_path())?;
+        Ok(())
+    };
+
+    let auto_hash_check = || -> bool {
+        let raw = std::env::var("EZKL_SRS_AUTO_HASH_CHECK").unwrap_or_default();
+        matches!(raw.trim().to_lowercase().as_str(), "1" | "true" | "yes")
+    };
+
+    let maybe_check_cache = || -> Result<(), EZKLError> {
+        match srs_source {
+            SrsSource::Public => enforce_public_srs_hash(k, &cache_path).map(|_| ()),
+            SrsSource::Auto => {
+                if is_marked_dummy(cache_path.as_path()) {
+                    warn!(
+                        "Using locally-generated (dummy) cached SRS at {} ({} exists).",
+                        cache_path.display(),
+                        srs_dummy_marker_path(cache_path.as_path()).display(),
+                    );
+                    Ok(())
+                } else if auto_hash_check() {
+                    warn_if_public_srs_hash_mismatch(k, &cache_path)
+                } else {
+                    // Skip expensive multi-GB hash scans by default in auto mode.
+                    Ok(())
+                }
+            }
+            SrsSource::Dummy => Ok(()),
+        }
+    };
+
+    // Prefer cache as canonical storage.
+    if Path::new(&cache_path).exists() {
+        maybe_check_cache()?;
+        ensure_out_from_cache()?;
+        return Ok(String::new());
+    }
+
+    // Cache missing, but output exists: try to backfill cache.
+    if Path::new(&out_path).exists() {
+        info!(
+            "SRS exists at requested path {} but cache {} is missing; backfilling cache.",
+            out_path.display(),
+            cache_path.display()
         );
 
-        info!("SRS downloaded");
-    } else {
-        info!("SRS already exists at that path");
-    };
-    // check the hash
-    check_srs_hash(k, srs_path.clone())?;
+        if let Err(e) = copy_srs_and_marker(out_path.as_path(), cache_path.as_path()) {
+            warn!(
+                "Failed to backfill global SRS cache {} from {}: {} (continuing with out_path only).",
+                cache_path.display(),
+                out_path.display(),
+                e
+            );
+            return Ok(String::new());
+        }
 
+        // If strict hash check fails, remove both cache and out_path to avoid "hard-link keeps corrupted copy alive".
+        if let Err(e) = maybe_check_cache() {
+            if srs_source == SrsSource::Public {
+                let _ = std::fs::remove_file(&out_path);
+                let _ = clear_dummy_marker(out_path.as_path());
+            }
+            return Err(e);
+        }
+
+        return Ok(String::new());
+    }
+
+    // Cache doesn't exist: materialize it.
+    match srs_source {
+        SrsSource::Dummy => {
+            eprintln!(
+                "EZKL_SRS_SOURCE=dummy: generating local/dummy SRS for k={} at {}.\n\
+                 This is NOT a trusted-setup SRS and must not be used in production.",
+                k,
+                cache_path.display()
+            );
+            let _ = gen_srs_cmd(cache_path.clone(), k)?;
+            mark_srs_as_dummy(cache_path.as_path())?;
+        }
+        SrsSource::Public | SrsSource::Auto => {
+            // Try public download, validate, save.
+            let srs_uri = format!("{}{}", PUBLIC_SRS_URL, k);
+            let tmp_path = PathBuf::from(format!("{}.download", cache_path.display()));
+
+            if tmp_path.exists() {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+
+            let dl = download_srs_to_file(&srs_uri, &tmp_path).await;
+            if let Err(e) = dl {
+                let _ = std::fs::remove_file(&tmp_path);
+                if srs_source == SrsSource::Auto {
+                    eprintln!(
+                        "Public SRS download failed: {e}\n\
+                         Falling back to a local/dummy SRS because EZKL_SRS_SOURCE=auto.\n\
+                         This is NOT a trusted-setup SRS and must not be used in production."
+                    );
+                    let _ = gen_srs_cmd(cache_path.clone(), k)?;
+                    mark_srs_as_dummy(cache_path.as_path())?;
+                    ensure_out_from_cache()?;
+                    return Ok(String::new());
+                } else {
+                    return Err(e);
+                }
+            }
+
+            // Move into place atomically.
+            ensure_parent_dir(&cache_path)?;
+            std::fs::rename(&tmp_path, &cache_path).map_err(|e| {
+                EZKLError::msg(format!(
+                    "failed to move downloaded SRS into cache {}: {e}",
+                    cache_path.display()
+                ))
+            })?;
+
+            // Public download should not be marked as dummy.
+            clear_dummy_marker(cache_path.as_path())?;
+
+            // Strict hash check only in Public mode (Auto skips by default; can opt-in via EZKL_SRS_AUTO_HASH_CHECK=1).
+            maybe_check_cache()?;
+        }
+    }
+
+    ensure_out_from_cache()?;
     Ok(String::new())
 }
 
@@ -596,12 +835,9 @@ pub(crate) fn gen_witness(
         None
     };
 
-    // NOTE: this used to be conditionally compiled, but the unconditional + cfg'd duplicate
-    // definition caused a "redefined variable" compilation error on some targets/features.
     let mut input = circuit.load_graph_input(&data)?;
 
     // if any of the settings have kzg visibility then we need to load the srs
-
     let region_settings =
         RegionSettings::all_true(settings.run_args.decomp_base, settings.run_args.decomp_legs);
 
@@ -628,15 +864,9 @@ pub(crate) fn gen_witness(
             )?
         }
     } else {
-        circuit.forward::<KZGCommitmentScheme<Bn256>>(
-            &mut input,
-            vk.as_ref(),
-            None,
-            region_settings,
-        )?
+        circuit.forward::<KZGCommitmentScheme<Bn256>>(&mut input, vk.as_ref(), None, region_settings)?
     };
 
-    // print each variable tuple (symbol, value) as symbol=value
     trace!(
         "witness generation {:?} took {:?}",
         circuit
@@ -653,7 +883,6 @@ pub(crate) fn gen_witness(
         witness.save(output_path)?;
     }
 
-    // print the witness in debug
     debug!("witness: \n {}", witness.as_json()?.to_colored_json_auto()?);
 
     Ok(witness)
@@ -691,11 +920,11 @@ pub(crate) fn gen_random_data(
 
     let input_facts = tract_model
         .input_outlets()
-        .map_err(|e| EZKLError::from(e.to_string()))?
+        .map_err(|e| EZKLError::msg(e.to_string()))?
         .iter()
         .map(|&i| tract_model.outlet_fact(i))
         .collect::<tract_onnx::prelude::TractResult<Vec<_>>>()
-        .map_err(|e| EZKLError::from(e.to_string()))?;
+        .map_err(|e| EZKLError::msg(e.to_string()))?;
 
     let min = min.unwrap_or(0.0);
     let max = max.unwrap_or(1.0);
@@ -753,8 +982,13 @@ pub(crate) fn gen_random_data(
 // not for wasm targets
 pub(crate) fn init_spinner() -> ProgressBar {
     let pb = indicatif::ProgressBar::new_spinner();
-    pb.set_draw_target(indicatif::ProgressDrawTarget::stdout());
-    pb.enable_steady_tick(Duration::from_millis(200));
+    // Write progress output to stderr so stdout can remain machine-readable (e.g., JSON).
+    pb.set_draw_target(indicatif::ProgressDrawTarget::stderr());
+
+    // Avoid spamming output when stderr is not a TTY (e.g., piped/captured by a parent process).
+    if std::io::stderr().is_terminal() {
+        pb.enable_steady_tick(Duration::from_millis(200));
+    }
     pb.set_style(
         ProgressStyle::with_template("[{elapsed_precise}] {spinner:.blue} {msg}")
             .unwrap()
@@ -774,8 +1008,13 @@ pub(crate) fn init_spinner() -> ProgressBar {
 // not for wasm targets
 pub(crate) fn init_bar(len: u64) -> ProgressBar {
     let pb = ProgressBar::new(len);
-    pb.set_draw_target(indicatif::ProgressDrawTarget::stdout());
-    pb.enable_steady_tick(Duration::from_millis(200));
+    // Write progress output to stderr so stdout can remain machine-readable (e.g., JSON).
+    pb.set_draw_target(indicatif::ProgressDrawTarget::stderr());
+
+    // Avoid spamming output when stderr is not a TTY (e.g., piped/captured by a parent process).
+    if std::io::stderr().is_terminal() {
+        pb.enable_steady_tick(Duration::from_millis(200));
+    }
     let sty = ProgressStyle::with_template(
         "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
     )

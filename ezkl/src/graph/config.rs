@@ -7,6 +7,7 @@ use crate::fieldutils::IntegerRep;
 use crate::{ProbabilisticSettings, RunArgs, EZKL_BUF_CAPACITY};
 
 use halo2curves::bn256::{self};
+use halo2curves::ff::PrimeField;
 use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -87,6 +88,16 @@ impl ProbOps {
     /// Returns true if `op` is enabled in this set.
     pub fn contains(&self, op: ProbOp) -> bool {
         self.0.contains(&op)
+    }
+
+    /// Insert an op if it is not already present. Returns true if the set changed.
+    pub fn insert(&mut self, op: ProbOp) -> bool {
+        if self.contains(op) {
+            false
+        } else {
+            self.0.push(op);
+            true
+        }
     }
 }
 
@@ -923,7 +934,7 @@ impl GraphSettings {
             .ceil() as u32
     }
 
-    fn dynamic_lookup_and_shuffle_col_size(&self) -> usize {
+     pub fn dynamic_lookup_and_shuffle_col_size(&self) -> usize {
         self.dynamic_lookup_params.total_dynamic_col_size
             + self.shuffle_params.total_shuffle_col_size
     }
@@ -997,7 +1008,7 @@ impl GraphSettings {
     pub fn save(&self, path: &std::path::PathBuf) -> Result<(), std::io::Error> {
         // buf writer
         let writer =
-            std::io::BufWriter::with_capacity(*EZKL_BUF_CAPACITY, std::fs::File::create(path)?);
+           std::io::BufWriter::with_capacity(EZKL_BUF_CAPACITY, std::fs::File::create(path)?);
         serde_json::to_writer(writer, &self).map_err(|e| {
             error!("failed to save settings file at {}", e);
             std::io::Error::other(e)
@@ -1008,13 +1019,17 @@ impl GraphSettings {
     pub fn load(path: &std::path::PathBuf) -> Result<Self, std::io::Error> {
         // buf reader
         let reader =
-            std::io::BufReader::with_capacity(*EZKL_BUF_CAPACITY, std::fs::File::open(path)?);
+            std::io::BufReader::with_capacity(EZKL_BUF_CAPACITY, std::fs::File::open(path)?);
         let settings: GraphSettings = serde_json::from_reader(reader).map_err(|e| {
             error!("failed to load settings file at {}", e);
             std::io::Error::other(e)
         })?;
 
         crate::check_version_string_matches(&settings.version);
+ // Keep the thread-local GLOBAL_SETTINGS in sync so circuit configuration can access it.
+        GLOBAL_SETTINGS.with(|gs| {
+            *gs.borrow_mut() = Some(settings.clone());
+        });
 
         Ok(settings)
     }

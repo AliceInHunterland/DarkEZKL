@@ -836,27 +836,6 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> ValTensor<F> {
         Ok(slice)
     }
 
-    /// Gets a reference to the inner tensor
-    ///
-    /// # Errors
-    /// Returns an error if called on an Instance tensor
-    pub fn get_inner_tensor(&self) -> Result<&Tensor<ValType<F>>, TensorError> {
-        Ok(match self {
-            ValTensor::Value { inner: v, .. } => v,
-            ValTensor::Instance { .. } => return Err(TensorError::WrongMethod),
-        })
-    }
-
-    /// Gets a mutable reference to the inner tensor
-    ///
-    /// # Errors
-    /// Returns an error if called on an Instance tensor
-    pub fn get_inner_tensor_mut(&mut self) -> Result<&mut Tensor<ValType<F>>, TensorError> {
-        Ok(match self {
-            ValTensor::Value { inner: v, .. } => v,
-            ValTensor::Instance { .. } => return Err(TensorError::WrongMethod),
-        })
-    }
 
     /// Gets the inner values as a tensor of Value<F>
     pub fn get_inner(&self) -> Result<Tensor<Value<F>>, TensorError> {
@@ -1353,6 +1332,28 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> ValTensor<F> {
 }
 
 impl<F: PrimeField + TensorType + PartialOrd> ValTensor<F> {
+    /// Gets a reference to the inner tensor
+    ///
+    /// # Errors
+    /// Returns an error if called on an Instance tensor
+    pub fn get_inner_tensor(&self) -> Result<&Tensor<ValType<F>>, TensorError> {
+        Ok(match self {
+            ValTensor::Value { inner: v, .. } => v,
+            ValTensor::Instance { .. } => return Err(TensorError::WrongMethod),
+        })
+    }
+
+    /// Gets a mutable reference to the inner tensor
+    ///
+    /// # Errors
+    /// Returns an error if called on an Instance tensor
+    pub fn get_inner_tensor_mut(&mut self) -> Result<&mut Tensor<ValType<F>>, TensorError> {
+        Ok(match self {
+            ValTensor::Value { inner: v, .. } => v,
+            ValTensor::Instance { .. } => return Err(TensorError::WrongMethod),
+        })
+    }
+
     /// Computes the multiplicative inverse of each element
     ///
     /// # Returns

@@ -242,7 +242,8 @@ def _export_large_mlp_onnx(*, out_dir: Path, hidden_dim: int, layers: int, repea
 
     _ensure_dir(out_dir)
     model = LargeMLP().eval().to("cpu")
-    x = torch.randn(1, hidden_dim, dtype=torch.float32)
+    # Use torch.rand for normalized [0,1] range instead of torch.randn to avoid calibration errors
+    x = torch.rand(1, hidden_dim, dtype=torch.float32)
     onnx_path = out_dir / "network.onnx"
     input_path = out_dir / "input.json"
 
@@ -281,13 +282,22 @@ def _export_named_model_onnx(*, model_name: str, out_dir: Path, cache_dir: Optio
     else:
         if model_name == "lenet-5-small":
             model, shape = _create_lenet_small_torch()
-            dummy_input = torch.randn(1, *shape)
+            # Use torch.rand for normalized [0,1] range to match MNIST normalization
+            dummy_input = torch.rand(1, *shape, dtype=torch.float32)
+            # LeNet with probabilistic verification needs higher scales to avoid calibration failures
+            defaults = {"input_scale": 5, "param_scale": 5, "num_inner_cols": 2}
         elif model_name == "repvgg-a0":
             model, shape = _create_repvgg_a0_torch()
-            dummy_input = torch.randn(1, *shape)
+            # Use torch.rand for normalized [0,1] range to match ImageNet normalization
+            dummy_input = torch.rand(1, *shape, dtype=torch.float32)
+            # RepVGG with probabilistic verification needs higher scales to avoid calibration failures
+            defaults = {"input_scale": 5, "param_scale": 5, "num_inner_cols": 2}
         elif model_name == "vit":
             model, shape = _create_vit_torch()
-            dummy_input = torch.randn(1, *shape)
+            # Use torch.rand for normalized [0,1] range to match ImageNet normalization
+            dummy_input = torch.rand(1, *shape, dtype=torch.float32)
+            # ViT requires higher num_inner_cols due to Transformer operations
+            defaults = {"input_scale": 3, "param_scale": 3, "num_inner_cols": 16}
         else:
             raise ValueError(f"Unknown model_name '{model_name}'. Supported: vit, lenet-5-small, repvgg-a0")
 
@@ -431,7 +441,14 @@ def _call_compile_circuit_python(ezkl_mod: Any, *, model: Path, compiled: Path, 
 
 
 def _call_get_srs_python(ezkl_mod: Any, *, settings: Path, srs_path: Path) -> None:
+    import sys
+    # Flush stdout/stderr to ensure progress messages are visible
+    sys.stdout.flush()
+    sys.stderr.flush()
     ok = ezkl_mod.get_srs(settings_path=str(settings), srs_path=str(srs_path))
+    # Flush again after call to show any progress output
+    sys.stdout.flush()
+    sys.stderr.flush()
     if ok is False:
         raise RuntimeError("ezkl.get_srs returned false")
 
@@ -523,23 +540,39 @@ def run_single_benchmark(
 
     timings: Dict[str, float] = {}
 
+    print(f"\n{'─'*60}")
+    print(f"Benchmark: {model_name} (prob_k={prob_k})")
+    print(f"{'─'*60}")
+
     # 2) Gen Settings (Hybrid: CLI + Python)
+    print("  [1/10] Generating settings...", end="", flush=True)
     t0 = _ns()
 
-    # A) Use CLI for base generation (ensures valid circuit params even if bindings are stubbed)
+    # A) Use CLI for base generation with probabilistic mode flags
     cli_gen = [
         "ezkl", "gen-settings",
         "-M", str(onnx_path),
         "-O", str(settings_path),
         "--input-scale", str(input_scale_v),
         "--param-scale", str(param_scale_v),
-        # Default visibility to private/public/fixed
         "--input-visibility", "private",
         "--output-visibility", "public",
-        "--param-visibility", "fixed"
+        "--param-visibility", "fixed",
     ]
-    # Try adding num_inner_cols args via generic --args if available,
-    # but ezkl cli handling varies. We rely on defaults or what the model requires.
+
+    # --- Dark-EZKL patch: ensure gen-settings runs in probabilistic mode ---
+    # ViT-class models are often too large to size in exact mode.
+    # Also, a tiny initial logrows can make dummy-layout/calibration brittle.
+    # For probabilistic verification with smaller models, a higher logrows helps with synthesis.
+    prob_ops_csv = prob_ops if isinstance(prob_ops, str) else ','.join(prob_ops)
+    cli_gen += [
+        '--logrows', '18',
+        '--check-mode', 'unsafe',
+        '--execution-mode', 'probabilistic',
+        '--prob-k', str(prob_k),
+        '--prob-ops', prob_ops_csv,
+        '--prob-seed-mode', str(prob_seed_mode),
+    ]
     _run_cli_cmd(cli_gen)
 
     # B) Use Python API to inject "local update" probabilistic params
@@ -563,9 +596,11 @@ def run_single_benchmark(
         prob_seed_mode=prob_seed_mode,
     )
     timings["gen_settings_s"] = _ns() - t0
+    print(f" done ({timings['gen_settings_s']:.2f}s)")
 
     # 3) Calibrate (Hybrid: CLI)
     # Use CLI to ensure robust calibration if Python binding is stubbed.
+    print("  [2/10] Calibrating settings...", end="", flush=True)
     t0 = _ns()
     cli_calib = [
         "ezkl", "calibrate-settings",
@@ -576,6 +611,7 @@ def run_single_benchmark(
     ]
     _run_cli_cmd(cli_calib)
     timings["calibrate_settings_s"] = _ns() - t0
+    print(f" done ({timings['calibrate_settings_s']:.2f}s)")
 
     # Read back settings
     settings_json = _read_json(settings_path)
@@ -587,12 +623,14 @@ def run_single_benchmark(
     constraint_count = _extract_constraint_count(settings_json)
 
     # 4) Compile (Hybrid: Python -> CLI fallback)
+    print("  [3/10] Compiling circuit...", end="", flush=True)
     t0 = _ns()
     try:
         _call_compile_circuit_python(ezkl, model=onnx_path, compiled=compiled_path, settings=settings_path)
     except (AttributeError, RuntimeError):
         _run_cli_cmd(["ezkl", "compile-circuit", "-M", str(onnx_path), "-S", str(settings_path), "--compiled-circuit", str(compiled_path)])
     timings["compile_circuit_s"] = _ns() - t0
+    print(f" done ({timings['compile_circuit_s']:.2f}s)")
 
     # 5) SRS
     if logrows is None:
@@ -600,6 +638,7 @@ def run_single_benchmark(
     srs_cache = _ensure_dir(out_dir / "_srs_cache")
     srs_path = srs_cache / f"k{logrows}.srs"
 
+    print(f"  [4/10] Getting SRS (logrows={logrows})...", end="", flush=True)
     t0 = _ns()
     if not srs_path.exists():
         try:
@@ -607,25 +646,31 @@ def run_single_benchmark(
         except (AttributeError, RuntimeError):
             _run_cli_cmd(["ezkl", "get-srs", "--settings-path", str(settings_path), "--srs-path", str(srs_path)])
     timings["get_srs_s"] = _ns() - t0
+    print(f" done ({timings['get_srs_s']:.2f}s)")
 
     # 6) Setup
+    print("  [5/10] Running setup (generating keys)...", end="", flush=True)
     t0 = _ns()
     try:
         _call_setup_python(ezkl, compiled=compiled_path, vk=vk_path, pk=pk_path, srs_path=srs_path)
     except (AttributeError, RuntimeError):
         _run_cli_cmd(["ezkl", "setup", "-M", str(compiled_path), "--vk-path", str(vk_path), "--pk-path", str(pk_path), "--srs-path", str(srs_path)])
     timings["setup_s"] = _ns() - t0
+    print(f" done ({timings['setup_s']:.2f}s)")
 
     # 7) Witness
+    print("  [6/10] Generating witness...", end="", flush=True)
     t0 = _ns()
     try:
         _call_gen_witness_python(ezkl, data=input_path, compiled=compiled_path, witness=witness_path, vk=vk_path, srs_path=srs_path)
     except (AttributeError, RuntimeError):
         _run_cli_cmd(["ezkl", "gen-witness", "-M", str(compiled_path), "-D", str(input_path), "--output", str(witness_path), "--vk-path", str(vk_path), "--srs-path", str(srs_path)])
     timings["gen_witness_s"] = _ns() - t0
+    print(f" done ({timings['gen_witness_s']:.2f}s)")
 
     # 8) Mock
     if not skip_mock:
+        print("  [7/10] Running mock proof...", end="", flush=True)
         t0 = _ns()
         try:
             try:
@@ -635,23 +680,36 @@ def run_single_benchmark(
         except (AttributeError, RuntimeError, NameError):
             _run_cli_cmd(["ezkl", "mock", "-M", str(compiled_path), "--witness", str(witness_path)])
         timings["mock_s"] = _ns() - t0
+        print(f" done ({timings['mock_s']:.2f}s)")
+    else:
+        print("  [7/10] Skipping mock proof")
 
     # 9) Prove
+    print("  [8/10] Generating proof (this may take a while)...", end="", flush=True)
     t0 = _ns()
     try:
         _call_prove_python(ezkl, witness=witness_path, compiled=compiled_path, pk=pk_path, proof=proof_path, srs_path=srs_path)
     except (AttributeError, RuntimeError):
         _run_cli_cmd(["ezkl", "prove", "-M", str(compiled_path), "--witness", str(witness_path), "--pk-path", str(pk_path), "--proof-path", str(proof_path), "--srs-path", str(srs_path)])
     timings["prove_s"] = _ns() - t0
+    print(f" done ({timings['prove_s']:.2f}s)")
 
     # 10) Verify
     if not skip_verify:
+        print("  [9/10] Verifying proof...", end="", flush=True)
         t0 = _ns()
         try:
             _call_verify_python(ezkl, proof=proof_path, settings=settings_path, vk=vk_path, srs_path=srs_path)
         except (AttributeError, RuntimeError):
             _run_cli_cmd(["ezkl", "verify", "--proof-path", str(proof_path), "--settings-path", str(settings_path), "--vk-path", str(vk_path), "--srs-path", str(srs_path)])
         timings["verify_s"] = _ns() - t0
+        print(f" done ({timings['verify_s']:.2f}s)")
+    else:
+        print("  [9/10] Skipping verification")
+
+    total_time = sum(timings.values())
+    print(f"  [10/10] Complete! Total time: {total_time:.2f}s")
+    print(f"{'─'*60}\n")
 
     return RunMetrics(
         model_name=model_name,

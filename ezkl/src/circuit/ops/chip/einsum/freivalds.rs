@@ -396,8 +396,8 @@ fn permute_valtensor<F: PrimeField + TensorType + PartialOrd + std::hash::Hash>(
 
     let desired_positions: Vec<usize> = desired_axes
         .iter()
-        .map(|ch| *pos.get(ch).ok_or(CircuitError::ConstrainError)?)
-        .collect();
+        .map(|ch| pos.get(ch).copied().ok_or(CircuitError::ConstrainError))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let new_dims: Vec<usize> = desired_positions.iter().map(|&i| curr_dims[i]).collect();
 

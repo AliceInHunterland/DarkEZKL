@@ -289,6 +289,98 @@ impl Op<Fp> for RebaseScale {
     }
 }
 
+/// Reduce mean over one or more axes (ONNX `ReduceMean`).
+///
+/// Implemented as:
+/// 1) `Sum` reduction over the given axes
+/// 2) elementwise division by the reduced length (a constant)
+///
+/// This keeps the implementation small and reuses existing gadgets.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReduceMean {
+    /// Axes to reduce over.
+    ///
+    /// If empty, we follow ONNX semantics and reduce over **all** axes.
+    pub axes: Vec<usize>,
+}
+
+impl Op<Fp> for ReduceMean {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_string(&self) -> String {
+        format!("REDUCE_MEAN (axes={:?})", self.axes)
+    }
+
+    fn out_scale(&self, in_scales: Vec<crate::Scale>) -> Result<crate::Scale, CircuitError> {
+        if in_scales.len() != 1 {
+            return Err(TensorError::DimMismatch(
+                "reduce_mean expects exactly 1 input scale".to_string(),
+            )
+            .into());
+        }
+        // Division by an unscaled constant preserves fixed-point scale.
+        Ok(in_scales[0])
+    }
+
+    fn layout(
+        &self,
+        config: &mut crate::circuit::BaseConfig<Fp>,
+        region: &mut crate::circuit::region::RegionCtx<Fp>,
+        values: &[&crate::tensor::ValTensor<Fp>],
+    ) -> Result<Option<crate::tensor::ValTensor<Fp>>, CircuitError> {
+        if values.len() != 1 {
+            return Err(TensorError::DimMismatch(
+                "reduce_mean expects exactly 1 input tensor".to_string(),
+            )
+            .into());
+        }
+
+        let in_dims = values[0].dims();
+        let axes: Vec<usize> = if self.axes.is_empty() {
+            (0..in_dims.len()).collect()
+        } else {
+            self.axes.clone()
+        };
+
+        // Validate axes and compute the reduction length.
+        let mut denom: usize = 1;
+        for &axis in &axes {
+            if axis >= in_dims.len() {
+                return Err(TensorError::DimMismatch(format!(
+                    "reduce_mean axis {} out of bounds for dims {:?}",
+                    axis, in_dims
+                ))
+                .into());
+            }
+            denom = denom.saturating_mul(in_dims[axis]);
+        }
+
+        if denom == 0 {
+            return Err(
+                TensorError::DimMismatch("reduce_mean reduction length is 0".to_string()).into(),
+            );
+        }
+
+        // 1) Reduce by summation.
+        let sum_op = PolyOp::Sum { axes };
+        let summed = sum_op
+            .layout(config, region, values)?
+            .ok_or_else(|| CircuitError::MissingLayout(<PolyOp as Op<Fp>>::as_string(&sum_op)))?;
+
+        // 2) Divide by the number of reduced elements.
+        let div_op = HybridOp::Div {
+            denom: (denom as f32).into(),
+        };
+        div_op.layout(config, region, &[&summed])
+    }
+
+    fn clone_dyn(&self) -> Box<dyn Op<Fp>> {
+        Box::new(self.clone())
+    }
+}
+
 /// Represents all supported operation types in the circuit
 /// Each variant encapsulates a different type of operation with specific behavior
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -299,6 +391,8 @@ pub enum SupportedOp {
     Nonlinear(LookupOp),
     /// Mixed operations combining different approaches
     Hybrid(HybridOp),
+    /// Reduction op: mean over axes (lowered from ONNX ReduceMean)
+    ReduceMean(ReduceMean),
     /// Input values to the circuit
     Input(Input),
     /// Constant values in the circuit
@@ -403,6 +497,7 @@ impl SupportedOp {
             SupportedOp::Linear(op) => op,
             SupportedOp::Nonlinear(op) => op,
             SupportedOp::Hybrid(op) => op,
+            SupportedOp::ReduceMean(op) => op,
             SupportedOp::Input(op) => op,
             SupportedOp::Constant(op) => op,
             SupportedOp::Unknown(op) => op,
@@ -438,6 +533,10 @@ impl From<Box<dyn Op<Fp>>> for SupportedOp {
 
         if let Some(op) = value.as_any().downcast_ref::<HybridOp>() {
             return SupportedOp::Hybrid(op.clone());
+        };
+
+        if let Some(op) = value.as_any().downcast_ref::<ReduceMean>() {
+            return SupportedOp::ReduceMean(op.clone());
         };
 
         if let Some(op) = value.as_any().downcast_ref::<Input>() {

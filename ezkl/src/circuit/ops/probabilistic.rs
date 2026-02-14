@@ -283,7 +283,7 @@ fn scalar_to_valtype<F: PrimeField + TensorType + PartialOrd>(
     let inner = t
         .get_inner_tensor()
         .map_err(|_| CircuitError::ConstrainError)?;
-    if inner.len() != 1 {
+    if inner.len() != 1usize {
         return Err(CircuitError::ConstrainError);
     }
     Ok(inner[0].clone())
@@ -439,10 +439,11 @@ mod tests {
 
     #[test]
     fn lcg_constants_nonzero() {
+        use halo2curves::ff::Field;
         let a = field_from_u64::<Fr>(LCG_A_U64);
         let c = field_from_u64::<Fr>(LCG_C_U64);
-        assert_ne!(a, Fr::ZERO);
-        assert_ne!(c, Fr::ZERO);
+        assert_ne!(a, Fr::zero());
+        assert_ne!(c, Fr::zero());
     }
 }
 

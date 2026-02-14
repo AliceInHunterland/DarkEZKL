@@ -348,7 +348,7 @@ where
     pub fn save(&self, proof_path: &PathBuf) -> Result<(), PfsysError> {
         let file = std::fs::File::create(proof_path)
             .map_err(|e| PfsysError::SaveProof(format!("{}", e)))?;
-        let mut writer = BufWriter::with_capacity(*EZKL_BUF_CAPACITY, file);
+        let mut writer = BufWriter::with_capacity(EZKL_BUF_CAPACITY, file);
         serde_json::to_writer(&mut writer, &self)
             .map_err(|e| PfsysError::SaveProof(format!("{}", e)))?;
         Ok(())
@@ -364,7 +364,7 @@ where
         trace!("reading proof");
         let file =
             std::fs::File::open(proof_path).map_err(|e| PfsysError::LoadProof(format!("{}", e)))?;
-        let reader = BufReader::with_capacity(*EZKL_BUF_CAPACITY, file);
+        let reader = BufReader::with_capacity(EZKL_BUF_CAPACITY, file);
         let proof: Self =
             serde_json::from_reader(reader).map_err(|e| PfsysError::LoadProof(format!("{}", e)))?;
         Ok(proof)
@@ -657,7 +657,7 @@ where
 {
     debug!("loading verification key from {:?}", path);
     let f = File::open(path.clone()).map_err(|e| PfsysError::LoadVk(format!("{}", e)))?;
-    let mut reader = BufReader::with_capacity(*EZKL_BUF_CAPACITY, f);
+    let mut reader = BufReader::with_capacity(EZKL_BUF_CAPACITY, f);
     let vk = VerifyingKey::<Scheme::Curve>::read::<_, C>(
         &mut reader,
         serde_format_from_str(&EZKL_KEY_FORMAT),
@@ -680,7 +680,7 @@ where
     debug!("loading proving key from {:?}", path);
     let start = instant::Instant::now();
     let f = File::open(path.clone()).map_err(|e| PfsysError::LoadPk(format!("{}", e)))?;
-    let mut reader = BufReader::with_capacity(*EZKL_BUF_CAPACITY, f);
+    let mut reader = BufReader::with_capacity(EZKL_BUF_CAPACITY, f);
     let pk = ProvingKey::<Scheme::Curve>::read::<_, C>(
         &mut reader,
         serde_format_from_str(&EZKL_KEY_FORMAT),
@@ -702,7 +702,7 @@ where
 {
     debug!("saving proving key 💾");
     let f = File::create(path)?;
-    let mut writer = BufWriter::with_capacity(*EZKL_BUF_CAPACITY, f);
+    let mut writer = BufWriter::with_capacity(EZKL_BUF_CAPACITY, f);
     pk.write(&mut writer, serde_format_from_str(&EZKL_KEY_FORMAT))?;
     writer.flush()?;
     info!("done saving proving key ✅");
@@ -719,7 +719,7 @@ where
 {
     debug!("saving verification key 💾");
     let f = File::create(path)?;
-    let mut writer = BufWriter::with_capacity(*EZKL_BUF_CAPACITY, f);
+    let mut writer = BufWriter::with_capacity(EZKL_BUF_CAPACITY, f);
     vk.write(&mut writer, serde_format_from_str(&EZKL_KEY_FORMAT))?;
     writer.flush()?;
     info!("done saving verification key ✅");
@@ -733,7 +733,7 @@ pub fn save_params<Scheme: CommitmentScheme>(
 ) -> Result<(), io::Error> {
     debug!("saving parameters 💾");
     let f = File::create(path)?;
-    let mut writer = BufWriter::with_capacity(*EZKL_BUF_CAPACITY, f);
+    let mut writer = BufWriter::with_capacity(EZKL_BUF_CAPACITY, f);
     params.write(&mut writer)?;
     writer.flush()?;
     Ok(())

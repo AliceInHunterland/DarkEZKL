@@ -1,7 +1,7 @@
 use super::errors::GraphError;
 #[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
 use super::VarScales;
-use super::{Rescaled, SupportedOp, Visibility};
+use super::{ReduceMean, Rescaled, SupportedOp, Visibility};
 #[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
 use crate::circuit::hybrid::HybridOp;
 #[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
@@ -787,6 +787,15 @@ pub fn new_op_from_onnx(
             let axes = op.axes.into_iter().collect();
 
             SupportedOp::Linear(PolyOp::Sum { axes })
+        }
+        "Reduce<Mean>" => {
+            if inputs.len() != 1 {
+                return Err(GraphError::InvalidDims(idx, "mean".to_string()));
+            };
+            let op = load_op::<Reduce>(node.op(), idx, node.op().name().to_string())?;
+            let axes: Vec<usize> = op.axes.into_iter().collect();
+
+            SupportedOp::ReduceMean(ReduceMean { axes })
         }
         "Reduce<MeanOfSquares>" => {
             if inputs.len() != 1 {

@@ -42,9 +42,11 @@ mod probabilistic_matmul {
         multiopen::{ProverSHPLONK, VerifierSHPLONK},
         strategy::SingleStrategy,
     };
-    use snark_verifier::system::halo2::transcript::evm::EvmTranscript;
+    use halo2_proofs::transcript::{Blake2bWrite, Blake2bRead, Challenge255};
+    use halo2curves::bn256::G1Affine;
+    use std::io::Cursor;
 
-    use crate::commands::{ExecutionMode, RunArgs};
+    use crate::commands::{ExecutionMode, ProbOp, ProbOps, RunArgs};
     use crate::circuit::ops::probabilistic::FreivaldsCheck;
 
     const K: usize = 8;
@@ -142,7 +144,7 @@ mod probabilistic_matmul {
                         let check = FreivaldsCheck::new(&self.a, &self.b, &self.c);
 
                         // Access the same einsum chip/config that BaseConfig uses.
-                        let einsums = config.einsums();
+                        let einsums = config.einsums.as_ref().expect("einsums not configured");
 
                         check
                             .layout(einsums, &mut region, &seed, 0, &CheckMode::SAFE)
@@ -172,7 +174,7 @@ mod probabilistic_matmul {
         // Configure probabilistic execution: only MatMul is probabilistic.
         let mut run_args = RunArgs::default();
         run_args.execution_mode = ExecutionMode::Probabilistic;
-        run_args.prob_ops = vec!["MatMul".to_string()];
+        run_args.prob_ops = ProbOps(vec![ProbOp::MatMul]);
 
         let params = crate::pfsys::srs::gen_srs::<KZGCommitmentScheme<_>>(K as u32);
 
@@ -188,9 +190,9 @@ mod probabilistic_matmul {
             ProverSHPLONK<_>,
             VerifierSHPLONK<_>,
             SingleStrategy<_>,
-            _,
-            EvmTranscript<_, _, _, _>,
-            EvmTranscript<_, _, _, _>,
+            Challenge255<G1Affine>,
+            Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
+            Blake2bRead<Cursor<Vec<u8>>, G1Affine, Challenge255<G1Affine>>,
         >(
             circuit.clone(),
             vec![],
@@ -198,7 +200,7 @@ mod probabilistic_matmul {
             &pk,
             // Safe mode: ensures the generated proof verifies correctly under the selected execution mode.
             CheckMode::SAFE,
-            Some(run_args),
+            None,  // No proof splitting in tests
             None,
         );
 
@@ -219,12 +221,10 @@ mod probabilistic_matmul {
         b.reshape(&[LEN, LEN]).unwrap();
 
         // Correct C for A=B=[[1,2],[3,4]] is [[7,10],[15,22]].
-        let mut c = Tensor::from(vec![
-            Value::known(F::from(7u64)),
-            Value::known(F::from(10u64)),
-            Value::known(F::from(15u64)),
-            Value::known(F::from(22u64)),
-        ]);
+        let mut c = Tensor::from((0..4).map(|i| {
+            let val = [7u64, 10, 15, 22][i];
+            Value::known(F::from(val))
+        }));
         c.reshape(&[LEN, LEN]).unwrap();
 
         // Perturb the witness (C[0,0] += 1).
@@ -240,7 +240,7 @@ mod probabilistic_matmul {
         // Configure probabilistic execution (matches Step 8 setup).
         let mut run_args = RunArgs::default();
         run_args.execution_mode = ExecutionMode::Probabilistic;
-        run_args.prob_ops = vec!["MatMul".to_string()];
+        run_args.prob_ops = ProbOps(vec![ProbOp::MatMul]);
 
         let params = crate::pfsys::srs::gen_srs::<KZGCommitmentScheme<_>>(K as u32);
 
@@ -256,16 +256,16 @@ mod probabilistic_matmul {
             ProverSHPLONK<_>,
             VerifierSHPLONK<_>,
             SingleStrategy<_>,
-            _,
-            EvmTranscript<_, _, _, _>,
-            EvmTranscript<_, _, _, _>,
+            Challenge255<G1Affine>,
+            Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
+            Blake2bRead<Cursor<Vec<u8>>, G1Affine, Challenge255<G1Affine>>,
         >(
             circuit,
             vec![],
             &params,
             &pk,
             CheckMode::SAFE,
-            Some(run_args),
+            None,  // No proof splitting in tests
             None,
         );
 
@@ -275,4 +275,3 @@ mod probabilistic_matmul {
         );
     }
 }
-

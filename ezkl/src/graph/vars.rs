@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{fmt::Display, str::FromStr};
 
 use crate::tensor::TensorType;
 use crate::tensor::{ValTensor, VarTensor};
@@ -6,12 +6,10 @@ use crate::RunArgs;
 use halo2_proofs::plonk::{Column, ConstraintSystem, Instance};
 use halo2curves::ff::PrimeField;
 use itertools::Itertools;
-use log::debug;
+use log::{debug, warn};
 #[cfg(feature = "python-bindings")]
 use pyo3::{exceptions::PyValueError, FromPyObject, IntoPyObject, PyResult, Python};
 use serde::{Deserialize, Serialize};
-#[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
-use tosubcommand::ToFlags;
 
 use self::errors::GraphError;
 use super::*;
@@ -61,11 +59,53 @@ impl Display for Visibility {
     }
 }
 
-#[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
-impl ToFlags for Visibility {
-    /// Converts visibility to command line flags
-    fn to_flags(&self) -> Vec<String> {
-        vec![format!("{}", self)]
+impl FromStr for Visibility {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let raw = s.trim();
+
+        if raw.to_lowercase().starts_with("hashed/private") {
+            // Expected: hashed/private/<csv outlets>
+            let (_, outlets_part) = raw
+                .rsplit_once('/')
+                .ok_or_else(|| "hashed/private visibility must include outlets: hashed/private/0,1".to_string())?;
+
+            let outlets = if outlets_part.trim().is_empty() {
+                vec![]
+            } else {
+                outlets_part
+                    .split(',')
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty())
+                    .map(|x| {
+                        x.parse::<usize>().map_err(|e| {
+                            format!("invalid outlet index '{}' in '{}': {}", x, raw, e)
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+
+            return Ok(Visibility::Hashed {
+                hash_is_public: false,
+                outlets,
+            });
+        }
+
+        match raw.to_lowercase().as_str() {
+            "private" => Ok(Visibility::Private),
+            "public" => Ok(Visibility::Public),
+            "polycommit" => Ok(Visibility::KZGCommit),
+            "fixed" => Ok(Visibility::Fixed),
+            "hashed" | "hashed/public" => Ok(Visibility::Hashed {
+                hash_is_public: true,
+                outlets: vec![],
+            }),
+            other => Err(format!(
+                "invalid visibility '{}'; expected one of: private, public, fixed, polycommit, hashed/public, hashed/private/<outlets>",
+                other
+            )),
+        }
     }
 }
 
