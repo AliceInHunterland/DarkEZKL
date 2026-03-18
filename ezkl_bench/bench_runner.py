@@ -24,6 +24,8 @@ def _run_single_model_in_worker(
     log_level: str,
     split_onnx: bool,
     split_min_params: int,
+    skip_verify: bool,
+    skip_mock: bool,
 ) -> ModelRunResult:
     """
     Runs a single model in a fresh subprocess.
@@ -57,6 +59,10 @@ def _run_single_model_in_worker(
         "--split-min-params",
         str(int(split_min_params)),
     ]
+    if skip_verify:
+        cmd.append("--skip-verify")
+    if skip_mock:
+        cmd.append("--skip-mock")
 
     logger.info("Spawning worker for model=%s cmd=%s", spec.key, cmd)
     res = run_subprocess_streaming(
@@ -125,6 +131,8 @@ def run_benchmark(
     log_level: str = "INFO",
     split_onnx: bool = True,
     split_min_params: int = 50_000,
+    skip_verify: bool = False,
+    skip_mock: bool = False,
 ) -> Dict[str, Any]:
     ensure_dir(out_json_path.parent)
     ensure_dir(artifacts_root)
@@ -169,6 +177,7 @@ def run_benchmark(
             "EZKL_ONNX_PRECISION": os.environ.get("EZKL_ONNX_PRECISION"),
             "EZKL_CHECK_MODE": os.environ.get("EZKL_CHECK_MODE"),
             "EZKL_LOOKUP_SAFETY_MARGIN": os.environ.get("EZKL_LOOKUP_SAFETY_MARGIN"),
+            "EZKL_PROB_SEED_MODE": os.environ.get("EZKL_PROB_SEED_MODE"),
         },
         "system": get_system_stats([Path("/app"), artifacts_root, cache_root]),
     }
@@ -189,6 +198,8 @@ def run_benchmark(
                 log_level=log_level,
                 split_onnx=split_onnx,
                 split_min_params=split_min_params,
+                skip_verify=skip_verify,
+                skip_mock=skip_mock,
             )
         else:
             r = run_single_model(
@@ -199,6 +210,8 @@ def run_benchmark(
                 warmup=warmup,
                 split_onnx=split_onnx,
                 split_min_params=split_min_params,
+                skip_verify=skip_verify,
+                skip_mock=skip_mock,
             )
 
         models_out[spec.display_name] = asdict(r)

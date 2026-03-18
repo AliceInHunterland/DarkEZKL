@@ -5,6 +5,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG EZKL_VERSION=23.0.3
 ARG EZKL_GIT_TAG=v23.0.3
+ARG ONNXRUNTIME_GPU_VERSION=1.20.1
 
 # Force UTF-8 everywhere to avoid locale/encoding-dependent failures
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -16,10 +17,32 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUST_BACKTRACE=1 \
     EZKL_DIR=/root/.ezkl \
     \
-    # SRS download mirrors have started returning HTTP 403 in many environments.
-    # For benchmarking we allow an automatic fallback to a locally-generated (DUMMY) SRS.
-    # Override at runtime with:  -e EZKL_SRS_SOURCE=public
+    # SRS downloads can be slow/blocked depending on environment.
+    #
+    # EZKL_SRS_SOURCE=auto:
+    #   - try downloading public trusted-setup SRS
+    #   - if that fails, fall back to generating a local "dummy" SRS ONLY for k <= EZKL_SRS_MAX_DUMMY_LOGROWS
+    #
+    # IMPORTANT:
+    #   Some environments get HTTP 403 / timeouts from the default public SRS bucket.
+    #   Generating a dummy SRS for very large k (especially k=26) can take hours and
+    #   often gets OOM-killed in Docker.
+    #
+    #   We therefore cap *auto* dummy generation at k=22 by default.
+    #   If you need k>22 without network access, pre-seed /root/.ezkl/srs/kzg{k}.srs
+    #   (see SRS_RECONSTRUCTION.md), or explicitly raise EZKL_SRS_MAX_DUMMY_LOGROWS at runtime.
+    #
+    # Override at runtime with:
+    #   -e EZKL_SRS_SOURCE=public   (never dummy; fail if download unavailable)
+    #   -e EZKL_SRS_SOURCE=dummy    (always dummy; can take a long time for big k)
     EZKL_SRS_SOURCE=auto \
+    EZKL_SRS_MAX_DUMMY_LOGROWS=22 \
+    \
+    # Download knobs (defaults chosen to avoid false timeouts on big files).
+    # Override at runtime if needed.
+    EZKL_SRS_CONNECT_TIMEOUT_SECS=10 \
+    EZKL_SRS_STALL_TIMEOUT_SECS=600 \
+    EZKL_SRS_PROGRESS_EVERY_SECS=30 \
     \
     ENABLE_ICICLE_GPU=true \
     TORCH_HOME=/app/.cache/torch \
@@ -51,6 +74,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     ninja-build \
     patchelf \
+    zlib1g \
     && rm -rf /var/lib/apt/lists/* \
     && git lfs install
 
@@ -65,10 +89,11 @@ RUN . "$HOME/.cargo/env" && \
 
 # ---- Python deps ----
 RUN python3 -m pip install --upgrade pip && \
+    python3 -m pip uninstall -y onnxruntime onnxruntime-gpu || true && \
     python3 -m pip install \
       "maturin>=1.0,<2.0" \
       onnx \
-      onnxruntime-gpu \
+      "onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}" \
       onnxconverter-common \
       numpy \
       pandas \
@@ -115,6 +140,11 @@ RUN . "$HOME/.cargo/env" && \
 # Optional Python deps for ezkl (do not fail build if file isn't present)
 RUN cd ezkl && \
     if [ -f requirements.txt ]; then python3 -m pip install -r requirements.txt; fi
+
+# ezkl/requirements.txt currently pins CPU-only onnxruntime==1.17.1.
+# Re-install the GPU wheel afterwards so CUDAExecutionProvider remains available at runtime.
+RUN python3 -m pip uninstall -y onnxruntime onnxruntime-gpu || true && \
+    python3 -m pip install --no-cache-dir "onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}"
 
 # ---- Build/install Python bindings (clean + deterministic) ----
 # IMPORTANT:
@@ -263,5 +293,7 @@ if not v:
 print("ezkl.version():", v)
 
 print("onnxruntime:", ort.__version__)
+print("onnxruntime file:", getattr(ort, "__file__", None))
+print("onnxruntime providers:", ort.get_available_providers())
 print("cuda available:", torch.cuda.is_available())
 PY

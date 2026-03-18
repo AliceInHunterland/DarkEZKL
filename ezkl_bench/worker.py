@@ -21,6 +21,8 @@ def main():
     # ONNX splitting controls
     p.add_argument("--split-onnx", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--split-min-params", type=int, default=50_000)
+    p.add_argument("--skip-verify", action="store_true")
+    p.add_argument("--skip-mock", action="store_true")
 
     args = p.parse_args()
 
@@ -59,6 +61,8 @@ def main():
         warmup=args.warmup,
         split_onnx=args.split_onnx,
         split_min_params=args.split_min_params,
+        skip_verify=args.skip_verify,
+        skip_mock=args.skip_mock,
     )
 
     write_json(out_path, r.__dict__)

@@ -16,6 +16,7 @@ This repository contains **Dark-EZKL**: a research-oriented fork of the upstream
 
 - **Probabilistic verification (design, knobs, security notes):** `PROBABILISTIC.md`
 - **Benchmarks (what is measured + how to interpret outputs):** `BENCHMARKS.md`
+- **Trusted SRS reconstruction / offline cache (avoid dummy k=26 OOM):** `SRS_RECONSTRUCTION.md`
 
 ---
 
@@ -40,6 +41,30 @@ The benchmark runner ships with a few built-in models (exported to ONNX by the r
 - NVIDIA Container Toolkit installed (so Docker can access GPUs)
 
 If you *don’t* have a GPU, you can still try running without `--gpus all`, but performance will be much slower and some configurations may not work.
+
+### GPU server quick path
+
+If you are preparing a fresh GPU server, the helper script gives you a reproducible flow:
+
+```bash
+chmod +x ./setup-gpu.sh
+./setup-gpu.sh check
+./setup-gpu.sh prepare
+./setup-gpu.sh build
+./setup-gpu.sh smoke
+```
+
+For the full suite once the smoke run succeeds:
+
+```bash
+./setup-gpu.sh suite
+```
+
+If your server cannot fetch the trusted SRS for large circuits, pre-seed it first:
+
+```bash
+./scripts/reconstruct_srs_kzg26.sh
+```
 
 ---
 
@@ -94,7 +119,7 @@ docker run --rm --gpus all --shm-size=16g \
   -v "$PWD/.ezkl:/root/.ezkl" \
   dark-ezkl:bench \
   python3 /app/benchmark.py --outdir /app/results \
-    --models lenet-5-small \
+    --models repvgg-a0 \
     --prob-k-values 2 \
     --runs 1
 ```
@@ -111,6 +136,25 @@ docker run --rm --gpus all --shm-size=16g \
   dark-ezkl:bench \
   python3 /app/benchmark.py --outdir /app/results
 ```
+
+### Alternative: Docker Compose
+
+The compose file is now server-oriented: it persists `results`, `.cache`, and the EZKL SRS cache under `./.ezkl`.
+
+```bash
+mkdir -p results cache .ezkl
+docker compose up --build test
+```
+
+Override the suite matrix without editing YAML:
+
+```bash
+BENCHMARK_MODELS=repvgg-a0 \
+BENCHMARK_PROB_K_VALUES=2 \
+BENCHMARK_RUNS=1 \
+docker compose up --build test
+```
+
 ### What you get (suite)
 - `results/benchmark.json` (suite summary: cases + aggregates + env)
 - `results/runs/<model>/k<prob_k>/run<i>/...` (per-run directories + artifacts)
@@ -191,9 +235,17 @@ Depending on the model, first run may download:
 
 Mounting `./cache:/app/.cache` avoids redownloading.
 
-### 2) SRS downloads can be large
-`ezkl get-srs` downloads the SRS for the chosen `logrows`.
-Mounting `./.ezkl:/root/.ezkl` avoids re-downloading across runs.
+### 2) SRS downloads / materialization can be large (and can look "stuck")
+`ezkl get-srs` needs an SRS for the chosen `logrows` (`k`).
+
+Tips:
+- **Persist the cache**: mount `./.ezkl:/root/.ezkl` to avoid re-downloading / re-generating across runs.
+- **No-network (benchmarking only, small k):** run with `-e EZKL_SRS_SOURCE=dummy` (**recommended only for `k <= 22`**).
+  - For `k=26`, dummy generation is huge and often gets OOM-killed; instead **pre-seed a trusted SRS**
+    at `./.ezkl/srs/kzg26.srs` (see `SRS_RECONSTRUCTION.md`, or run `./scripts/reconstruct_srs_kzg26.sh`).
+- If your **run directory is on a different filesystem** (common with Docker bind mounts), copying a multi‑GB SRS
+  can take a long time. Dark‑EZKL now tries **`hardlink → symlink → copy`** when writing to `--srs-path`.
+  - You can force this with `EZKL_SRS_MATERIALIZE=symlink` (or `auto|hardlink|copy`).
 
 ### 3) ViT is heavy
 `vit` can require higher `logrows` and significant RAM/VRAM.

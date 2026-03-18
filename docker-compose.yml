@@ -1,5 +1,6 @@
 services:
   test:
+    image: dark-ezkl:bench
     build:
       context: .
       dockerfile: Dockerfile
@@ -9,73 +10,51 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1 # or "all"
+              count: ${GPU_COUNT:-1}
               capabilities: [gpu]
 
-    # Ensure relative paths (e.g. benchmark.py) resolve consistently
     working_dir: /app
 
-    # Fixes for PyTorch/CUDA shared memory and stack limits
-    # "ipc: host" allows the container to use the host's shared memory, preventing OOM (exit code 137)
     ipc: host
     ulimits:
       memlock: -1
       stack: 67108864
 
     environment:
-      - ENABLE_ICICLE_GPU=true
-      # Force icicle to engage even for small-ish circuits (ezkl disables icicle for k<=8 by default).
-      # Setting to 0 means "treat no circuit as 'small'".
-      - ICICLE_SMALL_K=0
+      ENABLE_ICICLE_GPU: "true"
+      ICICLE_SMALL_K: "${ICICLE_SMALL_K:-0}"
 
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - TORCH_HOME=/app/.cache/torch
-      - XDG_CACHE_HOME=/app/.cache
-      - HF_HOME=/app/.cache/huggingface
-      - HF_HUB_DISABLE_TELEMETRY=1
+      NVIDIA_VISIBLE_DEVICES: "${NVIDIA_VISIBLE_DEVICES:-all}"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      TORCH_HOME: /app/.cache/torch
+      XDG_CACHE_HOME: /app/.cache
+      HF_HOME: /app/.cache/huggingface
+      HF_HUB_DISABLE_TELEMETRY: "1"
 
-      # Prefer fp16 ONNX for smaller circuits + faster witness gen.
-      # Options: fp16 | fp32 | int8 (int8 is best-effort; fp16 is recommended)
-      - EZKL_ONNX_PRECISION=fp16
+      EZKL_ONNX_PRECISION: "${EZKL_ONNX_PRECISION:-fp16}"
+      EZKL_CHECK_MODE: "${EZKL_CHECK_MODE:-unsafe}"
+      EZKL_LOOKUP_SAFETY_MARGIN: "${EZKL_LOOKUP_SAFETY_MARGIN:-1.02}"
+      EZKL_SRS_SOURCE: "${EZKL_SRS_SOURCE:-auto}"
+      EZKL_SRS_MAX_DUMMY_LOGROWS: "${EZKL_SRS_MAX_DUMMY_LOGROWS:-22}"
 
-      # Performance profiling: enable unsafe check mode (lower guarantees, faster)
-      - EZKL_CHECK_MODE=unsafe
-      - EZKL_LOOKUP_SAFETY_MARGIN=1.02
+      PYTHONFAULTHANDLER: "1"
+      MALLOC_ARENA_MAX: "2"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
 
-      # Better crash diagnostics + less memory fragmentation
-      - PYTHONFAULTHANDLER=1
-      - MALLOC_ARENA_MAX=2
+      ISOLATE_MODELS: "${ISOLATE_MODELS:-true}"
+      MODEL_PROCESS_TAIL_LINES: "${MODEL_PROCESS_TAIL_LINES:-250}"
 
-      # Logging
-      - LOG_LEVEL=INFO
-
-      # Runs each model in its own subprocess so a single OOM kill (exit 137)
-      # doesn't take down the whole benchmark container.
-      - ISOLATE_MODELS=true
-      - MODEL_PROCESS_TAIL_LINES=250
-
-      # Enable ONNX splitting for big models by default (can be overridden by CLI flags)
-      - SPLIT_ONNX=true
-      - SPLIT_MIN_PARAMS_M=0.05
+      SPLIT_ONNX: "${SPLIT_ONNX:-true}"
+      SPLIT_MIN_PARAMS_M: "${SPLIT_MIN_PARAMS_M:-0.05}"
 
     volumes:
-      - ./:/app/
+      - ./results:/app/results
+      - ./cache:/app/.cache
+      - ./.ezkl:/root/.ezkl
 
-    # Run the fixed probabilistic benchmark suite (enforced by benchmark.py):
-    #   models: vit,lenet-5-small,repvgg-a0
-    #   prob_k_values: 2,4
-    #   runs: 3
-    command:
-      [
-        "python3",
-        "/app/benchmark.py",
-        "--outdir",
-        "/app/results",
-        "--models",
-        "vit,lenet-5-small,repvgg-a0",
-        "--prob-k-values",
-        "4,8,16",
-        "--runs",
-        "7"
-      ]
+    command: >-
+      python3 /app/benchmark.py
+      --outdir /app/results
+      --models ${BENCHMARK_MODELS:-lenet-5-small,repvgg-a0,vit}
+      --prob-k-values ${BENCHMARK_PROB_K_VALUES:-2,4}
+      --runs ${BENCHMARK_RUNS:-3}

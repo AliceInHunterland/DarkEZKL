@@ -79,6 +79,13 @@ def main():
         help="Comma-separated ops to enable probabilistic checks for (e.g. MatMul,Gemm,Conv). "
         "Propagated via EZKL_PROB_OPS env var.",
     )
+    p.add_argument(
+        "--prob-seed-mode",
+        default=(os.environ.get("EZKL_PROB_SEED_MODE") or "fiat_shamir").strip(),
+        help="Probabilistic seed mode (e.g. fiat_shamir, public_seed). Propagated via EZKL_PROB_SEED_MODE env var.",
+    )
+    p.add_argument("--skip-verify", action="store_true", help="Skip verify stage.")
+    p.add_argument("--skip-mock", action="store_true", help="Skip mock stage.")
 
     args = p.parse_args()
 
@@ -89,6 +96,7 @@ def main():
     _set_env_if_not_none("EZKL_EXECUTION_MODE", args.execution_mode)
     _set_env_if_not_none("EZKL_PROB_K", args.prob_k)
     _set_env_if_not_none("EZKL_PROB_OPS", args.prob_ops)
+    _set_env_if_not_none("EZKL_PROB_SEED_MODE", args.prob_seed_mode)
 
     outdir = ensure_dir(Path(args.outdir))
     artifacts_root = ensure_dir(Path(args.artifacts))
@@ -97,7 +105,7 @@ def main():
     logger.info(
         "Starting benchmark. model=%s repeats=%s warmup=%s outdir=%s artifacts=%s cache=%s "
         "isolate_models=%s fail_fast=%s split_onnx=%s split_min_params_m=%s "
-        "execution_mode=%s prob_k=%s prob_ops=%s",
+        "execution_mode=%s prob_k=%s prob_ops=%s prob_seed_mode=%s skip_mock=%s skip_verify=%s",
         args.model,
         args.repeats,
         args.warmup,
@@ -111,12 +119,15 @@ def main():
         args.execution_mode,
         args.prob_k,
         args.prob_ops,
+        args.prob_seed_mode,
+        args.skip_mock,
+        args.skip_verify,
     )
 
     specs_map = get_model_specs(cache_root)
 
     if args.model == "all":
-        target_keys = ["lenet", "lenet-medium", "vit"]
+        target_keys = ["lenet-5-small", "lenet-medium", "vit", "repvgg-a0"]
         specs = [specs_map[k] for k in target_keys if k in specs_map]
     elif args.model in specs_map:
         specs = [specs_map[args.model]]
@@ -137,6 +148,8 @@ def main():
         log_level=args.log_level,
         split_onnx=args.split_onnx,
         split_min_params=int(args.split_min_params_m * 1_000_000),
+        skip_verify=args.skip_verify,
+        skip_mock=args.skip_mock,
     )
 
     logger.info("Wrote results JSON: %s", out_json)
@@ -157,3 +170,7 @@ def main():
             logger.exception("Plotting failed: %s", e)
 
     logger.info("Benchmark complete.")
+
+
+if __name__ == "__main__":
+    main()

@@ -2,12 +2,12 @@
 """
 Full benchmark suite orchestrator.
 
-This file orchestrates multiple runs of `bench_vit.py`, aggregates results, and generates plots
-using `ezkl_bench.plotting`.
+This file orchestrates multiple single-model EZKL benchmark runs, aggregates results, and
+generates plots using `ezkl_bench.plotting`.
 
 Notes:
-- `bench_vit.py` is the single-run executor. This file only orchestrates runs, aggregates results,
-  and then produces plots.
+- The outer CLI and output JSON remain stable for `setup-gpu.sh suite`.
+- The per-case executor is `ezkl_bench`, not `bench_vit.py`.
 - Plotting expects a legacy-ish JSON shape; we emit a compatible `bench_metrics.json` derived from
   our run cases and then call `ezkl_bench.plotting.plot(...)`.
 """
@@ -15,9 +15,11 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import platform
+import selectors
 import subprocess
 import sys
 import time
@@ -31,7 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # -----------------------------------------------------------------------------
 
 DEFAULT_EXECUTION_MODE = "probabilistic"
-DEFAULT_MODELS: List[str] = ["vit", "lenet-5-small", "repvgg-a0"]
+DEFAULT_MODELS: List[str] = ["lenet-5-small", "repvgg-a0", "vit"]
 DEFAULT_PROB_K_VALUES: List[int] = [2, 4]
 DEFAULT_RUNS_PER_CASE: int = 3
 
@@ -66,26 +68,107 @@ def _tail_text(s: str, max_lines: int = 200, max_chars: int = 20000) -> str:
     return "\n".join(lines).strip()
 
 
-def _run_subprocess(cmd: List[str], timeout_s: int) -> Dict[str, Any]:
+def _indent_text(s: str, prefix: str = "    ") -> str:
+    s = (s or "").rstrip()
+    if not s:
+        return ""
+    return "\n".join(f"{prefix}{line}" for line in s.splitlines())
+
+
+def _print_stream_line(log_prefix: str, stream_name: str, line: str) -> None:
+    prefix = f"{log_prefix}[{stream_name}] " if log_prefix else f"[{stream_name}] "
+    stream = sys.stderr if stream_name == "stderr" else sys.stdout
+    print(f"{prefix}{line}", end="" if line.endswith("\n") else "\n", file=stream, flush=True)
+
+
+def _run_subprocess(
+    cmd: List[str],
+    timeout_s: int,
+    *,
+    stdout_log_path: Optional[Path] = None,
+    stderr_log_path: Optional[Path] = None,
+    log_prefix: str = "",
+    env: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    stdout_chunks: List[str] = []
+    stderr_chunks: List[str] = []
+    start = time.perf_counter()
+
     try:
-        p = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_s,
-            check=False,
-        )
+        stdout_log_target = stdout_log_path if stdout_log_path is not None else Path(os.devnull)
+        stderr_log_target = stderr_log_path if stderr_log_path is not None else Path(os.devnull)
+        stdout_log_target.parent.mkdir(parents=True, exist_ok=True)
+        stderr_log_target.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(stdout_log_target, "w", encoding="utf-8") as stdout_log, open(
+            stderr_log_target, "w", encoding="utf-8"
+        ) as stderr_log:
+            p = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env if env is not None else dict(os.environ),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+
+            sel = selectors.DefaultSelector()
+            if p.stdout is not None:
+                sel.register(p.stdout, selectors.EVENT_READ, ("stdout", stdout_log, stdout_chunks))
+            if p.stderr is not None:
+                sel.register(p.stderr, selectors.EVENT_READ, ("stderr", stderr_log, stderr_chunks))
+
+            while sel.get_map():
+                remaining = timeout_s - (time.perf_counter() - start)
+                if remaining <= 0:
+                    p.kill()
+                    raise subprocess.TimeoutExpired(cmd, timeout_s)
+
+                events = sel.select(timeout=min(1.0, remaining))
+                if not events:
+                    continue
+
+                for key, _ in events:
+                    stream_name, log_file, chunks = key.data
+                    line = key.fileobj.readline()
+                    if line == "":
+                        try:
+                            sel.unregister(key.fileobj)
+                        except Exception:
+                            pass
+                        key.fileobj.close()
+                        continue
+
+                    chunks.append(line)
+                    log_file.write(line)
+                    log_file.flush()
+                    _print_stream_line(log_prefix, stream_name, line)
+
+            returncode = p.wait(timeout=5)
+            return {
+                "cmd": cmd,
+                "returncode": returncode,
+                "stdout": "".join(stdout_chunks),
+                "stderr": "".join(stderr_chunks),
+            }
+    except subprocess.TimeoutExpired as e:
         return {
             "cmd": cmd,
-            "returncode": p.returncode,
-            "stdout": p.stdout or "",
-            "stderr": p.stderr or "",
+            "error": f"TimeoutExpired({timeout_s}s): {e}",
+            "returncode": None,
+            "stdout": "".join(stdout_chunks),
+            "stderr": "".join(stderr_chunks),
         }
     except Exception as e:  # noqa: BLE001
-        return {"cmd": cmd, "error": repr(e), "returncode": None, "stdout": "", "stderr": ""}
+        return {
+            "cmd": cmd,
+            "error": repr(e),
+            "returncode": None,
+            "stdout": "".join(stdout_chunks),
+            "stderr": "".join(stderr_chunks),
+        }
 
 
 def _parse_csv_list(s: str) -> List[str]:
@@ -107,6 +190,238 @@ def _mean_std(values: List[float]) -> Tuple[Optional[float], Optional[float]]:
         return mu, 0.0
     var = sum((x - mu) ** 2 for x in values) / float(len(values) - 1)
     return mu, var**0.5
+
+
+def _mean(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    return sum(values) / float(len(values))
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+@contextlib.contextmanager
+def _temporary_env(overrides: Dict[str, Optional[str]]):
+    before: Dict[str, Optional[str]] = {}
+    for key, value in overrides.items():
+        before[key] = os.environ.get(key)
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = str(value)
+    try:
+        yield
+    finally:
+        for key, value in before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _split_enabled_from_env() -> bool:
+    return _env_flag("SPLIT_ONNX", True)
+
+
+def _split_min_params_from_env() -> int:
+    raw = (os.environ.get("SPLIT_MIN_PARAMS_M") or "0.05").strip()
+    try:
+        value = float(raw)
+    except Exception:
+        value = 0.05
+    return max(1, int(value * 1_000_000))
+
+
+def _model_env_suffix(model_name: str) -> str:
+    key = (model_name or "").strip().upper()
+    return "".join(ch if ch.isalnum() else "_" for ch in key)
+
+
+def _read_positive_int_env(candidates: List[str]) -> Optional[int]:
+    for name in candidates:
+        raw = (os.environ.get(name) or "").strip()
+        if not raw:
+            continue
+        try:
+            value = int(raw)
+        except Exception:
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _resolve_case_spec_defaults(model_name: str, cache_dir: Path) -> Dict[str, Optional[int]]:
+    try:
+        from ezkl_bench.models import get_model_specs
+    except Exception:
+        return {"display_name": model_name, "input_scale": None, "param_scale": None, "num_inner_cols": None}
+
+    specs = get_model_specs(cache_dir)
+    spec = specs.get(model_name)
+    if spec is None:
+        return {"display_name": model_name, "input_scale": None, "param_scale": None, "num_inner_cols": None}
+
+    suffix = _model_env_suffix(spec.key)
+    input_scale = _read_positive_int_env([f"EZKL_BENCH_INPUT_SCALE_{suffix}", "EZKL_BENCH_INPUT_SCALE"])
+    param_scale = _read_positive_int_env([f"EZKL_BENCH_PARAM_SCALE_{suffix}", "EZKL_BENCH_PARAM_SCALE"])
+    num_inner_cols = _read_positive_int_env([f"EZKL_BENCH_NUM_INNER_COLS_{suffix}", "EZKL_BENCH_NUM_INNER_COLS"])
+    return {
+        "display_name": spec.display_name,
+        "input_scale": int(input_scale) if input_scale is not None else int(spec.input_scale),
+        "param_scale": int(param_scale) if param_scale is not None else int(spec.param_scale),
+        "num_inner_cols": int(num_inner_cols) if num_inner_cols is not None else int(spec.num_inner_cols),
+    }
+
+
+def _segment_metric_sum(diagnostics: Dict[str, Any], key: str) -> Optional[float]:
+    total = 0.0
+    found = False
+    for seg in diagnostics.get("segments") or []:
+        if not isinstance(seg, dict):
+            continue
+        value = seg.get(key)
+        if value is None:
+            continue
+        try:
+            total += float(value)
+            found = True
+        except Exception:
+            continue
+    return total if found else None
+
+
+def _segment_path(diagnostics: Dict[str, Any], key: str) -> str:
+    for seg in diagnostics.get("segments") or []:
+        if not isinstance(seg, dict):
+            continue
+        value = seg.get(key)
+        if isinstance(value, dict) and value.get("path"):
+            return str(value["path"])
+    return ""
+
+
+def _segment_work_dir(diagnostics: Dict[str, Any]) -> str:
+    for seg in diagnostics.get("segments") or []:
+        if isinstance(seg, dict) and seg.get("work_dir"):
+            return str(seg["work_dir"])
+    return ""
+
+
+def _segment_int_sum(diagnostics: Dict[str, Any], key: str) -> Optional[int]:
+    total = 0
+    found = False
+    for seg in diagnostics.get("segments") or []:
+        if not isinstance(seg, dict):
+            continue
+        value = seg.get(key)
+        if value is None:
+            continue
+        try:
+            total += int(value)
+            found = True
+        except Exception:
+            continue
+    return total if found else None
+
+
+def _case_env_overrides(*, prob_k: int, prob_ops: List[str], prob_seed_mode: str) -> Dict[str, Optional[str]]:
+    return {
+        "EZKL_EXECUTION_MODE": DEFAULT_EXECUTION_MODE,
+        "EZKL_PROB_K": str(int(prob_k)),
+        "EZKL_PROB_OPS": ",".join(prob_ops),
+        "EZKL_PROB_SEED_MODE": str(prob_seed_mode),
+    }
+
+
+def _adapt_model_result_to_legacy_metrics(
+    *,
+    model_name: str,
+    prob_k: int,
+    prob_ops: List[str],
+    prob_seed_mode: str,
+    payload: Dict[str, Any],
+    spec_defaults: Dict[str, Optional[int]],
+) -> Dict[str, Any]:
+    diagnostics = payload.get("diagnostics") or {}
+    prove_times = [float(x) for x in (payload.get("prove_times_s") or [])]
+    verify_times = [float(x) for x in (payload.get("verify_times_s") or [])]
+
+    timings: Dict[str, float] = {}
+    for src_key, dst_key in (
+        ("setup_time_s", "setup_s"),
+        ("compile_time_s", "compile_circuit_s"),
+        ("calibrate_time_s", "calibrate_settings_s"),
+    ):
+        value = payload.get(src_key)
+        if value is None:
+            continue
+        try:
+            timings[dst_key] = float(value)
+        except Exception:
+            continue
+
+    for seg_key, dst_key in (
+        ("gen_settings_time_s", "gen_settings_s"),
+        ("get_srs_time_s", "get_srs_s"),
+        ("gen_witness_time_s", "gen_witness_s"),
+        ("mock_time_s", "mock_s"),
+    ):
+        total = _segment_metric_sum(diagnostics, seg_key)
+        if total is not None:
+            timings[dst_key] = float(total)
+
+    prove_mean = _mean(prove_times)
+    if prove_mean is not None:
+        timings["prove_s"] = float(prove_mean)
+    verify_mean = _mean(verify_times)
+    if verify_mean is not None:
+        timings["verify_s"] = float(verify_mean)
+
+    return {
+        "model_name": model_name,
+        "display_name": payload.get("display_name") or spec_defaults.get("display_name") or model_name,
+        "execution_mode": DEFAULT_EXECUTION_MODE,
+        "prob_k": int(prob_k),
+        "prob_ops": list(prob_ops),
+        "prob_seed_mode": str(prob_seed_mode),
+        "input_scale": spec_defaults.get("input_scale"),
+        "param_scale": spec_defaults.get("param_scale"),
+        "num_inner_cols": spec_defaults.get("num_inner_cols"),
+        "logrows": payload.get("logrows"),
+        "constraint_count": _segment_int_sum(diagnostics, "total_assignments"),
+        "timings_s": timings,
+        "prove_times_s": prove_times,
+        "verify_times_s": verify_times,
+        "settings_path": _segment_path(diagnostics, "settings"),
+        "compiled_path": _segment_path(diagnostics, "compiled"),
+        "witness_path": _segment_path(diagnostics, "witness"),
+        "proof_path": _segment_path(diagnostics, "proof"),
+        "work_dir": _segment_work_dir(diagnostics),
+        "slug": payload.get("slug"),
+        "diagnostics": diagnostics,
+    }
+
+
+def _write_legacy_case_report(
+    *,
+    report_path: Path,
+    metrics: Dict[str, Any],
+    payload: Dict[str, Any],
+) -> None:
+    _write_json(
+        report_path,
+        {
+            "backend": "ezkl_bench",
+            "metrics": metrics,
+            "model_result": payload,
+        },
+    )
 
 
 def _collect_aggregates(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -244,50 +559,95 @@ def _run_one_case_subprocess(
         timeout_s: int,
         tail_lines: int,
 ) -> Dict[str, Any]:
-    bench_vit_path = Path(__file__).with_name("bench_vit.py")
     run_dir = _ensure_dir(out_dir)
+    artifacts_dir = _ensure_dir(run_dir / "artifacts")
+    effective_cache_dir = _ensure_dir(cache_dir if cache_dir is not None else run_dir / ".cache")
+    result_path = run_dir / "ezkl_bench_model_result.json"
+    report_path = run_dir / "vit_bench_report.json"
+    stdout_log_path = run_dir / "bench_stdout.log"
+    stderr_log_path = run_dir / "bench_stderr.log"
+    case_tag = f"[{model_name}/k{int(prob_k)}/run{int(run_index)}]"
+    case_env = dict(os.environ)
+    case_env.update(
+        {
+            k: v
+            for k, v in _case_env_overrides(prob_k=int(prob_k), prob_ops=prob_ops, prob_seed_mode=prob_seed_mode).items()
+            if v is not None
+        }
+    )
 
     cmd = [
         sys.executable,
-        str(bench_vit_path),
-        "--outdir",
-        str(run_dir),
-        "--model-name",
+        "-m",
+        "ezkl_bench.worker",
+        "--model",
         str(model_name),
-        "--prob-k",
-        str(int(prob_k)),
-        "--prob-ops",
-        ",".join(prob_ops),
-        "--prob-seed-mode",
-        str(prob_seed_mode),
-        # legacy args accepted by bench_vit (ignored) but keep stable CLI surface
+        "--artifacts",
+        str(artifacts_dir),
+        "--cache",
+        str(effective_cache_dir),
+        "--out",
+        str(result_path),
         "--repeats",
         "1",
         "--warmup",
         "0",
+        "--log-level",
+        os.environ.get("LOG_LEVEL", "INFO"),
+        "--split-onnx" if _split_enabled_from_env() else "--no-split-onnx",
+        "--split-min-params",
+        str(_split_min_params_from_env()),
     ]
-    if cache_dir is not None:
-        cmd += ["--cache-dir", str(cache_dir)]
     if skip_verify:
-        cmd += ["--skip-verify"]
+        cmd.append("--skip-verify")
     if skip_mock:
-        cmd += ["--skip-mock"]
+        cmd.append("--skip-mock")
+
+    print(f"  Bench command: {' '.join(cmd)}")
+    print(f"  Live logs: stdout={stdout_log_path} stderr={stderr_log_path}")
 
     t0 = time.perf_counter()
-    res = _run_subprocess(cmd, timeout_s=timeout_s)
+    run_started_at = time.time()
+    res = _run_subprocess(
+        cmd,
+        timeout_s=timeout_s,
+        stdout_log_path=stdout_log_path,
+        stderr_log_path=stderr_log_path,
+        log_prefix=case_tag,
+        env=case_env,
+    )
     elapsed_s = time.perf_counter() - t0
 
-    report_path = run_dir / "vit_bench_report.json"
+    spec_defaults = _resolve_case_spec_defaults(model_name=str(model_name), cache_dir=effective_cache_dir)
+    payload: Optional[Dict[str, Any]] = None
     metrics: Optional[Dict[str, Any]] = None
     metrics_err: Optional[str] = None
-    if report_path.exists():
+    result_is_fresh = False
+    if result_path.exists():
         try:
-            payload = _read_json(report_path)
-            metrics = payload.get("metrics")
+            result_is_fresh = float(result_path.stat().st_mtime) >= (run_started_at - 1.0)
+        except Exception:
+            result_is_fresh = False
+    if result_is_fresh:
+        try:
+            payload = _read_json(result_path)
+            metrics = _adapt_model_result_to_legacy_metrics(
+                model_name=str(model_name),
+                prob_k=int(prob_k),
+                prob_ops=prob_ops,
+                prob_seed_mode=str(prob_seed_mode),
+                payload=payload,
+                spec_defaults=spec_defaults,
+            )
+            _write_legacy_case_report(report_path=report_path, metrics=metrics, payload=payload)
         except Exception as e:  # noqa: BLE001
-            metrics_err = f"failed reading {report_path}: {e!r}"
+            metrics_err = f"failed reading {result_path}: {e!r}"
+    elif result_path.exists():
+        metrics_err = f"ignoring stale result file at {result_path}"
 
-    ok = (res.get("returncode") == 0) and (metrics is not None)
+    model_error = payload.get("error") if isinstance(payload, dict) else None
+    model_traceback = payload.get("traceback") if isinstance(payload, dict) else None
+    ok = (res.get("returncode") == 0) and (metrics is not None) and not model_error
 
     return {
         "ok": bool(ok),
@@ -302,8 +662,14 @@ def _run_one_case_subprocess(
         "stderr_tail": _tail_text(str(res.get("stderr") or ""), max_lines=tail_lines),
         "bench_report_path": str(report_path),
         "bench_report_exists": report_path.exists(),
+        "model_result_path": str(result_path),
+        "model_result_exists": result_path.exists(),
+        "stdout_log": str(stdout_log_path),
+        "stderr_log": str(stderr_log_path),
         "metrics": metrics,
         "metrics_error": metrics_err,
+        "error": model_error,
+        "traceback": model_traceback,
         "subprocess_error": res.get("error"),
     }
 
@@ -321,46 +687,68 @@ def _run_one_case_inprocess(
         skip_mock: bool,
 ) -> Dict[str, Any]:
     t0 = time.perf_counter()
+    run_dir = _ensure_dir(out_dir)
+    artifacts_dir = _ensure_dir(run_dir / "artifacts")
+    effective_cache_dir = _ensure_dir(cache_dir if cache_dir is not None else run_dir / ".cache")
+    result_path = run_dir / "ezkl_bench_model_result.json"
+    report_path = run_dir / "vit_bench_report.json"
     try:
-        # This directly exercises the updated probabilistic PyRunArgs path in bench_vit.
-        from bench_vit import run_single_benchmark  # type: ignore
+        from dataclasses import asdict
+        from ezkl_bench.bench import run_single_model  # type: ignore
+        from ezkl_bench.models import get_model_specs  # type: ignore
 
-        metrics_obj = run_single_benchmark(
+        specs = get_model_specs(effective_cache_dir)
+        spec = specs[str(model_name)]
+        case_env = _case_env_overrides(prob_k=int(prob_k), prob_ops=prob_ops, prob_seed_mode=prob_seed_mode)
+        with _temporary_env(case_env):
+            result_obj = run_single_model(
+                spec=spec,
+                artifacts_root=artifacts_dir,
+                cache_root=effective_cache_dir,
+                repeats=1,
+                warmup=0,
+                split_onnx=_split_enabled_from_env(),
+                split_min_params=_split_min_params_from_env(),
+                skip_verify=bool(skip_verify),
+                skip_mock=bool(skip_mock),
+            )
+
+        payload = asdict(result_obj)
+        _write_json(result_path, payload)
+        spec_defaults = _resolve_case_spec_defaults(model_name=str(model_name), cache_dir=effective_cache_dir)
+        metrics = _adapt_model_result_to_legacy_metrics(
             model_name=str(model_name),
             prob_k=int(prob_k),
-            out_dir=_ensure_dir(out_dir),
-            prob_ops=list(prob_ops),
+            prob_ops=prob_ops,
             prob_seed_mode=str(prob_seed_mode),
-            cache_dir=cache_dir,
-            skip_verify=bool(skip_verify),
-            skip_mock=bool(skip_mock),
+            payload=payload,
+            spec_defaults=spec_defaults,
         )
-
-        # bench_vit writes vit_bench_report.json too; but for aggregation we serialize the object we got.
-        try:
-            from dataclasses import asdict
-
-            metrics = asdict(metrics_obj)
-        except Exception:
-            metrics = getattr(metrics_obj, "__dict__", {})  # fallback
+        _write_legacy_case_report(report_path=report_path, metrics=metrics, payload=payload)
 
         elapsed_s = time.perf_counter() - t0
         return {
-            "ok": True,
+            "ok": not payload.get("error"),
             "model_name": model_name,
             "prob_k": int(prob_k),
             "run_index": int(run_index),
             "elapsed_s": float(elapsed_s),
-            "run_dir": str(out_dir),
+            "run_dir": str(run_dir),
             "metrics": metrics,
+            "error": payload.get("error"),
+            "traceback": payload.get("traceback"),
+            "bench_report_path": str(report_path),
+            "bench_report_exists": report_path.exists(),
+            "model_result_path": str(result_path),
+            "model_result_exists": result_path.exists(),
         }
     except Exception as e:  # noqa: BLE001
         elapsed_s = time.perf_counter() - t0
         tb = traceback.format_exc()
 
-        diag_path = out_dir / "inprocess_error.txt"
+        diag_path = run_dir / "inprocess_error.txt"
         try:
-            _ensure_dir(out_dir)
+            _ensure_dir(run_dir)
             diag_path.write_text(tb, encoding="utf-8")
         except Exception:
             # Best-effort only; do not mask the original exception.
@@ -372,7 +760,7 @@ def _run_one_case_inprocess(
             "prob_k": int(prob_k),
             "run_index": int(run_index),
             "elapsed_s": float(elapsed_s),
-            "run_dir": str(out_dir),
+            "run_dir": str(run_dir),
             "error": repr(e),
             "traceback": tb,
             "diagnostic": str(diag_path),
@@ -390,6 +778,49 @@ def _extract_timing_s(metrics: Dict[str, Any], key: str) -> Optional[float]:
         return float(v)
     except Exception:
         return None
+
+
+def _format_metric_s(metrics: Dict[str, Any], key: str) -> str:
+    val = _extract_timing_s(metrics, key)
+    if val is None:
+        return "n/a"
+    return f"{val:.2f}s"
+
+
+def _print_case_result(case: Dict[str, Any]) -> None:
+    if case.get("ok") and isinstance(case.get("metrics"), dict):
+        metrics = case["metrics"]
+        print(
+            "  Summary: "
+            f"logrows={metrics.get('logrows')}, "
+            f"setup={_format_metric_s(metrics, 'setup_s')}, "
+            f"prove={_format_metric_s(metrics, 'prove_s')}, "
+            f"verify={_format_metric_s(metrics, 'verify_s')}"
+        )
+        return
+
+    print("  Failure details:")
+    if case.get("subprocess_error"):
+        print(_indent_text(f"subprocess_error: {case['subprocess_error']}"))
+    if case.get("error"):
+        print(_indent_text(f"error: {case['error']}"))
+    if case.get("metrics_error"):
+        print(_indent_text(f"metrics_error: {case['metrics_error']}"))
+    if case.get("diagnostic"):
+        print(_indent_text(f"diagnostic: {case['diagnostic']}"))
+    if case.get("stdout_log"):
+        print(_indent_text(f"stdout_log: {case['stdout_log']}"))
+    if case.get("stderr_log"):
+        print(_indent_text(f"stderr_log: {case['stderr_log']}"))
+    if case.get("stdout_tail"):
+        print("    stdout tail:")
+        print(_indent_text(str(case["stdout_tail"]), prefix="      "))
+    if case.get("stderr_tail"):
+        print("    stderr tail:")
+        print(_indent_text(str(case["stderr_tail"]), prefix="      "))
+    if case.get("traceback"):
+        print("    traceback:")
+        print(_indent_text(str(case["traceback"]), prefix="      "))
 
 
 def _make_plot_payload_from_cases(
@@ -641,6 +1072,7 @@ def main() -> int:
 
                 status = "✓ OK" if case.get("ok") else "✗ FAILED"
                 print(f"  {status} - Elapsed: {case_elapsed:.1f}s")
+                _print_case_result(case)
 
                 # Calculate and show estimated time remaining
                 if case_counter < total_cases:

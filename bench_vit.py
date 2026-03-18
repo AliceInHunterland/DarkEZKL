@@ -21,6 +21,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from ezkl_bench.srs_utils import resolve_compatible_srs
+
 
 # -----------------------------
 # Data structures
@@ -127,18 +129,26 @@ def _ns() -> float:
 
 def _run_cli_cmd(cmd: List[str], timeout: Optional[int] = None) -> None:
     # Run a command, raise error on failure.
-    # We suppress stdout to avoid noise in the benchmark logs unless it fails.
+    # We keep stdout/stderr captured so failures show the full command context.
     try:
-        subprocess.run(
+        completed = subprocess.run(
             cmd,
             check=True,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             timeout=timeout,
         )
+        if completed.stdout:
+            print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n")
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"CLI command failed: {' '.join(cmd)}\nStderr: {e.stderr}") from e
+        raise RuntimeError(
+            f"CLI command failed: {' '.join(cmd)}\n"
+            f"Stdout: {e.stdout}\n"
+            f"Stderr: {e.stderr}"
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"CLI command timed out after {timeout}s: {' '.join(cmd)}") from e
 
 
 # -----------------------------
@@ -487,6 +497,17 @@ def _call_verify_python(ezkl_mod: Any, *, proof: Path, settings: Path, vk: Path,
         raise RuntimeError("ezkl.verify returned false")
 
 
+def _resolve_srs_path(*, logrows: int, srs_path: Path) -> Optional[Path]:
+    resolved = resolve_compatible_srs(
+        logrows,
+        preferred_paths=[srs_path],
+        search_dirs=[srs_path.parent],
+    )
+    if resolved is None:
+        return None
+    return resolved.path
+
+
 # -----------------------------
 # Public API: single-run executor
 # -----------------------------
@@ -543,6 +564,17 @@ def run_single_benchmark(
     print(f"\n{'─'*60}")
     print(f"Benchmark: {model_name} (prob_k={prob_k})")
     print(f"{'─'*60}")
+    print(f"  Output dir: {out_dir}")
+    print(f"  Model dir : {model_dir}")
+    print(f"  Work dir  : {work_dir}")
+    print(
+        "  Settings  : "
+        f"input_scale={input_scale_v}, "
+        f"param_scale={param_scale_v}, "
+        f"num_inner_cols={num_inner_cols_v}, "
+        f"prob_ops={prob_ops}, "
+        f"seed_mode={prob_seed_mode}"
+    )
 
     # 2) Gen Settings (Hybrid: CLI + Python)
     print("  [1/10] Generating settings...", end="", flush=True)
@@ -636,15 +668,20 @@ def run_single_benchmark(
     if logrows is None:
         logrows = int(os.environ.get("EZKL_DEFAULT_LOGROWS", "17"))
     srs_cache = _ensure_dir(out_dir / "_srs_cache")
-    srs_path = srs_cache / f"k{logrows}.srs"
+    requested_srs_path = srs_cache / f"k{logrows}.srs"
+    effective_srs_path = requested_srs_path
 
     print(f"  [4/10] Getting SRS (logrows={logrows})...", end="", flush=True)
     t0 = _ns()
-    if not srs_path.exists():
+    shared_srs = _resolve_srs_path(logrows=logrows, srs_path=requested_srs_path)
+    if shared_srs is not None:
+        effective_srs_path = shared_srs
+        print(f" reused compatible cache ({shared_srs})", end="", flush=True)
+    elif not requested_srs_path.exists():
         try:
-            _call_get_srs_python(ezkl, settings=settings_path, srs_path=srs_path)
+            _call_get_srs_python(ezkl, settings=settings_path, srs_path=requested_srs_path)
         except (AttributeError, RuntimeError):
-            _run_cli_cmd(["ezkl", "get-srs", "--settings-path", str(settings_path), "--srs-path", str(srs_path)])
+            _run_cli_cmd(["ezkl", "get-srs", "--settings-path", str(settings_path), "--srs-path", str(requested_srs_path)])
     timings["get_srs_s"] = _ns() - t0
     print(f" done ({timings['get_srs_s']:.2f}s)")
 
@@ -652,9 +689,9 @@ def run_single_benchmark(
     print("  [5/10] Running setup (generating keys)...", end="", flush=True)
     t0 = _ns()
     try:
-        _call_setup_python(ezkl, compiled=compiled_path, vk=vk_path, pk=pk_path, srs_path=srs_path)
+        _call_setup_python(ezkl, compiled=compiled_path, vk=vk_path, pk=pk_path, srs_path=effective_srs_path)
     except (AttributeError, RuntimeError):
-        _run_cli_cmd(["ezkl", "setup", "-M", str(compiled_path), "--vk-path", str(vk_path), "--pk-path", str(pk_path), "--srs-path", str(srs_path)])
+        _run_cli_cmd(["ezkl", "setup", "-M", str(compiled_path), "--vk-path", str(vk_path), "--pk-path", str(pk_path), "--srs-path", str(effective_srs_path)])
     timings["setup_s"] = _ns() - t0
     print(f" done ({timings['setup_s']:.2f}s)")
 
@@ -662,9 +699,9 @@ def run_single_benchmark(
     print("  [6/10] Generating witness...", end="", flush=True)
     t0 = _ns()
     try:
-        _call_gen_witness_python(ezkl, data=input_path, compiled=compiled_path, witness=witness_path, vk=vk_path, srs_path=srs_path)
+        _call_gen_witness_python(ezkl, data=input_path, compiled=compiled_path, witness=witness_path, vk=vk_path, srs_path=effective_srs_path)
     except (AttributeError, RuntimeError):
-        _run_cli_cmd(["ezkl", "gen-witness", "-M", str(compiled_path), "-D", str(input_path), "--output", str(witness_path), "--vk-path", str(vk_path), "--srs-path", str(srs_path)])
+        _run_cli_cmd(["ezkl", "gen-witness", "-M", str(compiled_path), "-D", str(input_path), "--output", str(witness_path), "--vk-path", str(vk_path), "--srs-path", str(effective_srs_path)])
     timings["gen_witness_s"] = _ns() - t0
     print(f" done ({timings['gen_witness_s']:.2f}s)")
 
@@ -688,9 +725,9 @@ def run_single_benchmark(
     print("  [8/10] Generating proof (this may take a while)...", end="", flush=True)
     t0 = _ns()
     try:
-        _call_prove_python(ezkl, witness=witness_path, compiled=compiled_path, pk=pk_path, proof=proof_path, srs_path=srs_path)
+        _call_prove_python(ezkl, witness=witness_path, compiled=compiled_path, pk=pk_path, proof=proof_path, srs_path=effective_srs_path)
     except (AttributeError, RuntimeError):
-        _run_cli_cmd(["ezkl", "prove", "-M", str(compiled_path), "--witness", str(witness_path), "--pk-path", str(pk_path), "--proof-path", str(proof_path), "--srs-path", str(srs_path)])
+        _run_cli_cmd(["ezkl", "prove", "-M", str(compiled_path), "--witness", str(witness_path), "--pk-path", str(pk_path), "--proof-path", str(proof_path), "--srs-path", str(effective_srs_path)])
     timings["prove_s"] = _ns() - t0
     print(f" done ({timings['prove_s']:.2f}s)")
 
@@ -699,9 +736,9 @@ def run_single_benchmark(
         print("  [9/10] Verifying proof...", end="", flush=True)
         t0 = _ns()
         try:
-            _call_verify_python(ezkl, proof=proof_path, settings=settings_path, vk=vk_path, srs_path=srs_path)
+            _call_verify_python(ezkl, proof=proof_path, settings=settings_path, vk=vk_path, srs_path=effective_srs_path)
         except (AttributeError, RuntimeError):
-            _run_cli_cmd(["ezkl", "verify", "--proof-path", str(proof_path), "--settings-path", str(settings_path), "--vk-path", str(vk_path), "--srs-path", str(srs_path)])
+            _run_cli_cmd(["ezkl", "verify", "--proof-path", str(proof_path), "--settings-path", str(settings_path), "--vk-path", str(vk_path), "--srs-path", str(effective_srs_path)])
         timings["verify_s"] = _ns() - t0
         print(f" done ({timings['verify_s']:.2f}s)")
     else:

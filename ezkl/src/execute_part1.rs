@@ -341,17 +341,72 @@ impl SrsSource {
     fn from_env() -> Self {
         let raw = std::env::var("EZKL_SRS_SOURCE").unwrap_or_default();
         match raw.trim().to_lowercase().as_str() {
-            "" | "public" | "download" => SrsSource::Public,
-            "auto" => SrsSource::Auto,
+            "" | "auto" => SrsSource::Auto,
+            "public" | "download" => SrsSource::Public,
             "dummy" | "local" | "gen" | "generate" => SrsSource::Dummy,
             other => {
                 warn!(
-                    "Unknown EZKL_SRS_SOURCE='{}' (expected public|auto|dummy); defaulting to 'public'",
+                    "Unknown EZKL_SRS_SOURCE='{}' (expected public|auto|dummy); defaulting to 'auto'",
                     other
                 );
-                SrsSource::Public
+                SrsSource::Auto
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SrsMaterializeMode {
+    /// Try hardlink, then symlink, then copy.
+    Auto,
+    /// Only try hardlink, then copy.
+    Hardlink,
+    /// Only try symlink, then copy.
+    Symlink,
+    /// Always copy.
+    Copy,
+}
+
+impl SrsMaterializeMode {
+    fn from_env() -> Self {
+        let raw = std::env::var("EZKL_SRS_MATERIALIZE").unwrap_or_default();
+        match raw.trim().to_lowercase().as_str() {
+            "" | "auto" => Self::Auto,
+            "hardlink" | "hard-link" | "link" => Self::Hardlink,
+            "symlink" | "softlink" | "soft-link" => Self::Symlink,
+            "copy" | "cp" => Self::Copy,
+            other => {
+                warn!(
+                    "Unknown EZKL_SRS_MATERIALIZE='{}' (expected auto|hardlink|symlink|copy); defaulting to 'auto'",
+                    other
+                );
+                Self::Auto
+            }
+        }
+    }
+}
+
+fn path_exists_no_follow(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+fn try_symlink_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(from, to)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(from, to)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = from;
+        let _ = to;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "symlinks are not supported on this platform",
+        ))
     }
 }
 
@@ -397,20 +452,69 @@ fn copy_srs_and_marker(from: &Path, to: &Path) -> Result<(), EZKLError> {
 
     ensure_parent_dir(to)?;
 
-    // Prefer hard-link to avoid multi-GB copies (common in Docker bind-mount setups).
-    // If it fails (e.g., cross-device), fall back to a real copy.
-    if !to.exists() {
-        if let Err(link_err) = std::fs::hard_link(from, to) {
-            // Fall back to copy (EXDEV is common when crossing filesystems/mounts).
-            std::fs::copy(from, to).map_err(|copy_err| {
+    // If `to` exists but doesn't resolve, it's likely a broken symlink.
+    // Remove it so we can recreate.
+    if path_exists_no_follow(to) && !to.exists() {
+        eprintln!(
+            "[get-srs] removing broken SRS link at {} (target missing)",
+            to.display()
+        );
+        let _ = std::fs::remove_file(to);
+        let _ = clear_dummy_marker(to);
+    }
+
+    // Materialize the SRS at `to` only if it doesn't exist (without following symlinks).
+    if !path_exists_no_follow(to) {
+        let mode = SrsMaterializeMode::from_env();
+
+        let mut copy_file = || -> Result<(), EZKLError> {
+            let start = Instant::now();
+            eprintln!(
+                "[get-srs] copying SRS {} -> {} (this can be multi-GB; may take a while)",
+                from.display(),
+                to.display()
+            );
+
+            let n = std::fs::copy(from, to).map_err(|copy_err| {
                 EZKLError::msg(format!(
-                    "failed to hard-link SRS {} -> {}: {}; and failed to copy: {}",
+                    "failed to copy SRS {} -> {}: {}",
                     from.display(),
                     to.display(),
-                    link_err,
                     copy_err
                 ))
             })?;
+
+            eprintln!(
+                "[get-srs] copy complete: {:.1} MiB in {:.0}s",
+                mib(n),
+                start.elapsed().as_secs_f64()
+            );
+            Ok(())
+        };
+
+        match mode {
+            SrsMaterializeMode::Copy => copy_file()?,
+            SrsMaterializeMode::Hardlink => {
+                if let Err(e) = std::fs::hard_link(from, to) {
+                    eprintln!("[get-srs] hard-link failed ({e}); falling back to copy");
+                    copy_file()?;
+                }
+            }
+            SrsMaterializeMode::Symlink => {
+                if let Err(e) = try_symlink_file(from, to) {
+                    eprintln!("[get-srs] symlink failed ({e}); falling back to copy");
+                    copy_file()?;
+                }
+            }
+            SrsMaterializeMode::Auto => {
+                if let Err(link_err) = std::fs::hard_link(from, to) {
+                    eprintln!("[get-srs] hard-link failed ({link_err}); trying symlink");
+                    if let Err(sym_err) = try_symlink_file(from, to) {
+                        eprintln!("[get-srs] symlink failed ({sym_err}); falling back to copy");
+                        copy_file()?;
+                    }
+                }
+            }
         }
     }
 
@@ -426,8 +530,21 @@ fn copy_srs_and_marker(from: &Path, to: &Path) -> Result<(), EZKLError> {
 
 pub(crate) fn gen_srs_cmd(srs_path: PathBuf, logrows: u32) -> Result<String, EZKLError> {
     ensure_parent_dir(&srs_path)?;
+    eprintln!(
+        "[gen-srs] generating local/dummy SRS for k={} at {} (this may take a while)",
+        logrows,
+        srs_path.display()
+    );
+    let start = Instant::now();
     let params = gen_srs::<KZGCommitmentScheme<Bn256>>(logrows);
     save_params::<KZGCommitmentScheme<Bn256>>(&srs_path, &params)?;
+    let elapsed = start.elapsed();
+    let size = std::fs::metadata(&srs_path).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "[gen-srs] done in {:.0}s (size: {:.1} MiB)",
+        elapsed.as_secs_f64(),
+        mib(size)
+    );
     Ok(String::new())
 }
 
@@ -438,39 +555,139 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
 fn mib(x: u64) -> f64 {
     (x as f64) / (1024.0 * 1024.0)
+}
+
+fn expand_url_template(template: &str, k: u32) -> String {
+    let t = template.trim();
+    if t.contains("{k}") {
+        t.replace("{k}", &k.to_string())
+    } else if t.contains("{}") {
+        t.replace("{}", &k.to_string())
+    } else {
+        format!("{t}{k}")
+    }
+}
+
+fn public_srs_uris_for_k(k: u32) -> Vec<String> {
+    // Multiple mirrors (comma-separated), each entry can be:
+    // - a base prefix (we append k)
+    // - a template containing {k} or {} placeholder
+    if let Ok(raw) = std::env::var("EZKL_PUBLIC_SRS_URLS") {
+        let mut out = vec![];
+        for part in raw.split(',') {
+            let p = part.trim();
+            if !p.is_empty() {
+                out.push(expand_url_template(p, k));
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+
+    if let Ok(tmpl) = std::env::var("EZKL_PUBLIC_SRS_URL_TEMPLATE") {
+        let t = tmpl.trim();
+        if !t.is_empty() {
+            return vec![expand_url_template(t, k)];
+        }
+    }
+
+    let base = std::env::var("EZKL_PUBLIC_SRS_URL").unwrap_or_else(|_| PUBLIC_SRS_URL.to_string());
+    vec![expand_url_template(&base, k)]
+}
+
+fn parse_content_range_total(h: &str) -> Option<u64> {
+    // Expected:
+    //   "bytes 0-1023/2048"
+    //   "bytes 1024-2047/2048"
+    // We only care about the total part after "/".
+    let (_, total) = h.rsplit_once('/')?;
+    let total = total.trim();
+    if total == "*" {
+        return None;
+    }
+    total.parse::<u64>().ok()
 }
 
 async fn download_srs_to_file(uri: &str, out_path: &Path) -> Result<(), EZKLError> {
     let pb = {
         let pb = init_spinner();
         pb.set_message(format!(
-            "Downloading SRS (this may take a while) ... ({uri} -> {})",
+            "Downloading SRS (streaming; resumable) ... ({uri} -> {})",
             out_path.display()
         ));
         pb
     };
 
     let connect_timeout_s = env_u64("EZKL_SRS_CONNECT_TIMEOUT_SECS", 15);
-    let stall_timeout_s = env_u64("EZKL_SRS_STALL_TIMEOUT_SECS", 60);
+    let stall_timeout_s = env_u64("EZKL_SRS_STALL_TIMEOUT_SECS", 600);
     let progress_every_s = env_u64("EZKL_SRS_PROGRESS_EVERY_SECS", 30);
 
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(connect_timeout_s))
         .build()?;
 
-    // NOTE: Some hosts/WAFs block non-browser user agents. Setting a conservative UA helps.
+    ensure_parent_dir(out_path)?;
+
+    // If a partial download exists, attempt to resume via HTTP Range.
+    let mut existing_len: u64 = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+
+    if existing_len > 0 {
+        eprintln!(
+            "[get-srs] resuming download: have {:.1} MiB already at {}",
+            mib(existing_len),
+            out_path.display()
+        );
+    }
+
+    let mut make_req = |range_start: Option<u64>| {
+        let mut req = client
+            .get(uri)
+            .header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (X11; Linux x86_64) dark-ezkl/bench (reqwest)",
+            )
+            .body(vec![]);
+        if let Some(start) = range_start {
+            req = req.header(reqwest::header::RANGE, format!("bytes={start}-"));
+        }
+        req
+    };
+
+    // First attempt: with Range if we have an existing partial file.
     #[allow(unused_mut)]
-    let mut resp = client
-        .get(uri)
-        .header(
-            reqwest::header::USER_AGENT,
-            "Mozilla/5.0 (X11; Linux x86_64) dark-ezkl/bench (reqwest)",
-        )
-        .body(vec![])
+    let mut resp = make_req(if existing_len > 0 { Some(existing_len) } else { None })
         .send()
         .await?;
+
+    // If the server ignored Range (200 OK), restart from scratch.
+    if existing_len > 0 && resp.status() == reqwest::StatusCode::OK {
+        eprintln!(
+            "[get-srs] server ignored Range request (got 200 OK); restarting download from scratch"
+        );
+        existing_len = 0;
+        let _ = std::fs::remove_file(out_path);
+        resp = make_req(None).send().await?;
+    }
+
+    // If the server rejects Range (416), restart from scratch.
+    if resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        eprintln!(
+            "[get-srs] server rejected Range request (HTTP 416); restarting download from scratch"
+        );
+        existing_len = 0;
+        let _ = std::fs::remove_file(out_path);
+        resp = make_req(None).send().await?;
+    }
 
     let status = resp.status();
     if !status.is_success() {
@@ -481,31 +698,59 @@ async fn download_srs_to_file(uri: &str, out_path: &Path) -> Result<(), EZKLErro
 
         return Err(EZKLError::msg(format!(
             "failed to download SRS from {uri} (HTTP {status}).\n\
-             Hint: set EZKL_SRS_SOURCE=auto (fallback to dummy) or EZKL_SRS_SOURCE=dummy (no download).\n\
+             Hint: set a mirror via EZKL_PUBLIC_SRS_URLS or use EZKL_SRS_SOURCE=public|dummy.\n\
              Response body (first {snippet_len} bytes):\n{snippet}"
         )));
     }
 
-    ensure_parent_dir(out_path)?;
-    
-    // Immediately report that download is starting
-    eprintln!("[get-srs] streaming download from {uri} to {}", out_path.display());
+    let resume_mode =
+        existing_len > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
 
-    // Stream body to disk (avoid buffering multi-GB SRS in RAM).
-    let file = std::fs::File::create(out_path)?;
+    // Determine total size if possible.
+    let total = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        resp.headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|hv| hv.to_str().ok())
+            .and_then(parse_content_range_total)
+            .or_else(|| resp.content_length().map(|rem| rem + existing_len))
+    } else {
+        resp.content_length()
+    };
+
+    // Immediately report that download is starting
+    eprintln!(
+        "[get-srs] streaming download from {uri} to {}{}",
+        out_path.display(),
+        if resume_mode { " (resume)" } else { "" }
+    );
+
+    if let Some(t) = total {
+        eprintln!(
+            "[get-srs] size: {:.1} MiB total{}",
+            mib(t),
+            if resume_mode {
+                format!(", {:.1} MiB already present", mib(existing_len))
+            } else {
+                "".to_string()
+            }
+        );
+    } else {
+        eprintln!("[get-srs] size: unknown");
+    }
+
+    let file = if resume_mode {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(out_path)?
+    } else {
+        std::fs::File::create(out_path)?
+    };
     let mut writer = BufWriter::with_capacity(EZKL_BUF_CAPACITY, file);
 
-    let total = resp.content_length();
     let start = Instant::now();
-    let mut downloaded: u64 = 0;
+    let mut downloaded: u64 = existing_len;
     let mut last_report = Instant::now();
-    
-    // Report initial state
-    if let Some(t) = total {
-        eprintln!("[get-srs] starting download: {:.1} MiB total", mib(t));
-    } else {
-        eprintln!("[get-srs] starting download: size unknown");
-    }
 
     loop {
         let next: Result<Option<Bytes>, reqwest::Error> = tokio::time::timeout(
@@ -517,7 +762,9 @@ async fn download_srs_to_file(uri: &str, out_path: &Path) -> Result<(), EZKLErro
             pb.finish_and_clear();
             EZKLError::msg(format!(
                 "SRS download stalled for >= {stall_timeout_s}s from {uri}.\n\
-                 Hint: set EZKL_SRS_SOURCE=dummy to skip download."
+                 - Increase stall timeout: EZKL_SRS_STALL_TIMEOUT_SECS=600\n\
+                 - Or use a mirror via EZKL_PUBLIC_SRS_URLS\n\
+                 - Or set EZKL_SRS_SOURCE=dummy (benchmarking only)"
             ))
         })?;
 
@@ -761,27 +1008,88 @@ pub(crate) async fn get_srs_cmd(
         }
         SrsSource::Public | SrsSource::Auto => {
             // Try public download, validate, save.
-            let srs_uri = format!("{}{}", PUBLIC_SRS_URL, k);
+            let uris = public_srs_uris_for_k(k);
             let tmp_path = PathBuf::from(format!("{}.download", cache_path.display()));
 
+            // Important: do NOT delete tmp_path if it exists.
+            // It may contain a partial download; `download_srs_to_file` will attempt to resume via HTTP Range.
             if tmp_path.exists() {
-                let _ = std::fs::remove_file(&tmp_path);
+                eprintln!(
+                    "[get-srs] found partial download at {} (will attempt to resume)",
+                    tmp_path.display()
+                );
             }
 
-            let dl = download_srs_to_file(&srs_uri, &tmp_path).await;
-            if let Err(e) = dl {
-                let _ = std::fs::remove_file(&tmp_path);
+            let mut last_err: Option<EZKLError> = None;
+            for (i, uri) in uris.iter().enumerate() {
+                eprintln!(
+                    "[get-srs] public SRS download attempt {}/{}: {}",
+                    i + 1,
+                    uris.len(),
+                    uri
+                );
+                match download_srs_to_file(uri, &tmp_path).await {
+                    Ok(()) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("[get-srs] download attempt failed: {e}");
+                        last_err = Some(e);
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(e) = last_err {
                 if srs_source == SrsSource::Auto {
+                    // Prevent auto-generating enormous dummy SRS for large k (can take hours).
+                    let max_dummy_k = env_u32("EZKL_SRS_MAX_DUMMY_LOGROWS", 22);
+
+                    if max_dummy_k == 0 || k > max_dummy_k {
+                        return Err(EZKLError::msg(format!(
+                            "Public SRS download failed for k={k}.\n\
+                             Auto-fallback to a dummy SRS is disabled for k > {max_dummy_k} \
+                             (EZKL_SRS_MAX_DUMMY_LOGROWS={max_dummy_k}).\n\
+                             This avoids accidentally generating a huge dummy SRS which can take hours.\n\
+                             \n\
+                             Last download error: {e}\n\
+                             Partial download (if any) is kept at: {}\n\
+                             \n\
+                             Fix options:\n\
+                               1) Use a reachable mirror:\n\
+                                  - EZKL_PUBLIC_SRS_URLS='https://mirror1/...-,https://mirror2/...-'\n\
+                                  - or EZKL_PUBLIC_SRS_URL_TEMPLATE='https://mirror/...-{{k}}'\n\
+                               2) If your network is slow, increase timeouts:\n\
+                                  - EZKL_SRS_STALL_TIMEOUT_SECS=600\n\
+                                  - EZKL_SRS_PROGRESS_EVERY_SECS=30\n\
+                               3) If you truly want an insecure dummy SRS, explicitly set:\n\
+                                  - EZKL_SRS_SOURCE=dummy\n\
+                                  (warning: k={k} dummy generation can take a long time)\n\
+                               4) Or raise the auto dummy cap (not recommended):\n\
+                                  - EZKL_SRS_MAX_DUMMY_LOGROWS=26\n",
+                            tmp_path.display()
+                        )));
+                    }
+
                     eprintln!(
                         "Public SRS download failed: {e}\n\
-                         Falling back to a local/dummy SRS because EZKL_SRS_SOURCE=auto.\n\
+                         Falling back to a local/dummy SRS because EZKL_SRS_SOURCE=auto \
+                         and k={k} <= EZKL_SRS_MAX_DUMMY_LOGROWS={max_dummy_k}.\n\
                          This is NOT a trusted-setup SRS and must not be used in production."
                     );
+
+                    // Remove any partial download to avoid confusion.
+                    if tmp_path.exists() {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+
                     let _ = gen_srs_cmd(cache_path.clone(), k)?;
                     mark_srs_as_dummy(cache_path.as_path())?;
                     ensure_out_from_cache()?;
                     return Ok(String::new());
                 } else {
+                    // Public mode: do not delete tmp_path (resumable); fail.
                     return Err(e);
                 }
             }

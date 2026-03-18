@@ -277,6 +277,11 @@ class ModelSpec:
     num_inner_cols: int = 2
 
     enable_onnx_split: bool = False
+    split_min_params: Optional[int] = None
+    split_max_nodes: Optional[int] = None
+    max_segment_logrows: Optional[int] = None
+    max_segment_rows: Optional[int] = None
+    max_segment_assignments: Optional[int] = None
     precision: Optional[str] = None
 
     # Post-export ONNX patching knobs
@@ -339,7 +344,13 @@ def get_model_specs(cache_dir: Path) -> Dict[str, ModelSpec]:
             factory=lambda: get_repvgg_a0_pretrained(cache_dir),
             input_scale=3,
             param_scale=3,
+            num_inner_cols=8,
             enable_onnx_split=True,
+            split_min_params=10_000,
+            split_max_nodes=12,
+            max_segment_logrows=23,
+            max_segment_rows=8_000_000,
+            max_segment_assignments=64_000_000,
             precision=None,
             rewrite_gemm=False,
         ),
@@ -362,7 +373,13 @@ def get_model_specs(cache_dir: Path) -> Dict[str, ModelSpec]:
         factory=lambda: get_repvgg_a0_pretrained(cache_dir),
         input_scale=3,
         param_scale=3,
+        num_inner_cols=8,
         enable_onnx_split=True,
+        split_min_params=10_000,
+        split_max_nodes=12,
+        max_segment_logrows=23,
+        max_segment_rows=8_000_000,
+        max_segment_assignments=64_000_000,
         precision=None,
         rewrite_gemm=False,
     )

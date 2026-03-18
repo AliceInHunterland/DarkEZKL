@@ -213,6 +213,7 @@ fn update_settings_file(
 mod pyo3_bindings {
     use super::update_settings_file;
     use std::path::PathBuf;
+    use std::process::Command;
 
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
     use pyo3::prelude::*;
@@ -351,17 +352,97 @@ mod pyo3_bindings {
         Ok(())
     }
 
+    fn maybe_positional_string(args: &Bound<'_, PyTuple>, idx: usize) -> PyResult<Option<String>> {
+        if args.len() <= idx {
+            return Ok(None);
+        }
+        let s: String = args.get_item(idx)?.extract()?;
+        let s = s.trim().to_string();
+        if s.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(s))
+        }
+    }
+
+    /// Python: get_srs(..., settings_path=..., srs_path=..., logrows=...)
+    ///
+    /// IMPORTANT:
+    /// The "minimal" Dark-EZKL Python wheel (built with `--features python-bindings` only)
+    /// does not embed the full proving system. To keep the wheel small (and avoid feature
+    /// conflicts), we implement `get_srs()` by **shelling out to the `ezkl` CLI**.
+    ///
+    /// This fixes:
+    ///   AttributeError: module 'ezkl' has no attribute 'get_srs'
+    ///
+    /// Expected kwargs:
+    /// - settings_path: path to settings.json (optional if logrows is provided)
+    /// - srs_path: output path (optional; if omitted, ezkl uses ~/.ezkl/srs/kzg{k}.srs)
+    /// - logrows: u32 (optional; overrides settings_path if provided)
+    #[pyfunction]
+    #[pyo3(signature = (*args, **kwargs))]
+    pub fn get_srs(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<bool> {
+        let settings_path = get_kwarg_string(kwargs, "settings_path")?
+            .or_else(|| maybe_positional_string(args, 0).ok().flatten())
+            .map(PathBuf::from);
+
+        let srs_path = get_kwarg_string(kwargs, "srs_path")?
+            .or_else(|| maybe_positional_string(args, 1).ok().flatten())
+            .map(PathBuf::from);
+
+        let logrows = get_kwarg_u32(kwargs, "logrows")?;
+
+        if settings_path.is_none() && logrows.is_none() {
+            return Err(PyValueError::new_err(
+                "get_srs requires either settings_path=<path> or logrows=<u32>",
+            ));
+        }
+
+        let mut cmd = Command::new("ezkl");
+        cmd.arg("get-srs");
+
+        if let Some(sp) = &settings_path {
+            cmd.arg("--settings-path").arg(sp);
+        }
+        if let Some(op) = &srs_path {
+            cmd.arg("--srs-path").arg(op);
+        }
+        if let Some(k) = logrows {
+            cmd.arg("--logrows").arg(k.to_string());
+        }
+
+        let out = cmd.output().map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "failed to execute `ezkl get-srs` via subprocess: {e}\n\
+                 Hint: ensure the ezkl CLI is installed and on PATH."
+            ))
+        })?;
+
+        if out.status.success() {
+            return Ok(true);
+        }
+
+        // Include both streams for easier debugging in notebook/runner environments.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(PyRuntimeError::new_err(format!(
+            "`ezkl get-srs` failed (exit={:?}).\n\nstdout:\n{stdout}\n\nstderr:\n{stderr}",
+            out.status.code()
+        )))
+    }
+
     /// Helper to register functions onto a module.
     pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(gen_settings, m)?)?;
         m.add_function(wrap_pyfunction!(calibrate_settings, m)?)?;
+        m.add_function(wrap_pyfunction!(get_srs, m)?)?;
         Ok(())
     }
 }
 
 #[cfg(feature = "python-bindings")]
 #[allow(unused_imports)]
-pub use pyo3_bindings::{calibrate_settings, gen_settings, register};
+pub use pyo3_bindings::{calibrate_settings, gen_settings, get_srs, register};
 
 /// Non-Python builds: keep the module compiling without pyo3.
 #[cfg(not(feature = "python-bindings"))]
