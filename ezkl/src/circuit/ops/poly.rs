@@ -28,7 +28,7 @@ fn sync_global_settings_from_region<
     region: &RegionCtx<F>,
 ) {
     use crate::commands::ExecutionMode as CmdExecutionMode;
-    use crate::graph::config::{GLOBAL_SETTINGS, ProbOp, ProbOps};
+    use crate::graph::config::{ProbOp, ProbOps, GLOBAL_SETTINGS};
 
     GLOBAL_SETTINGS.with(|gs| {
         // Take the current global settings (if any) or create defaults.

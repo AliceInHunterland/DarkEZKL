@@ -3,10 +3,10 @@ use std::io::{BufReader, BufWriter};
 
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
-use halo2_proofs::plonk::{ConstraintSystem, Error};
-use halo2_proofs::poly::commitment::CommitmentScheme;
 use halo2_proofs::plonk::Circuit;
 use halo2_proofs::plonk::VerifyingKey;
+use halo2_proofs::plonk::{ConstraintSystem, Error};
+use halo2_proofs::poly::commitment::CommitmentScheme;
 
 use halo2curves::bn256::{Fr as Fp, G1Affine};
 use itertools::Itertools;
@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::circuit::region::ConstantsMap;
 use crate::circuit::table::Range;
 use crate::circuit::CheckMode;
-use crate::tensor::{Tensor, ValTensor};
 use crate::fieldutils::IntegerRep;
+use crate::tensor::{Tensor, ValTensor};
 
 use super::errors::GraphError;
 use super::input::{FileSourceInner, GraphData};
@@ -146,8 +146,10 @@ impl GraphCircuit {
         let mut required_k = (model_rows as f64).log2().ceil() as u32;
         required_k = required_k.max(self.settings.module_constraint_logrows_with_blinding());
         required_k = required_k.max(self.settings.log2_total_instances_with_blinding());
-        required_k =
-            required_k.max(self.settings.dynamic_lookup_and_shuffle_logrows_with_blinding());
+        required_k = required_k.max(
+            self.settings
+                .dynamic_lookup_and_shuffle_logrows_with_blinding(),
+        );
         required_k = required_k.max(self.settings.range_check_log_rows_with_blinding());
         required_k = required_k.max(super::MIN_LOGROWS);
 
@@ -177,8 +179,8 @@ impl GraphCircuit {
         let range_len_u: u128 = max_l.abs_diff(min_l);
 
         for k in required_k..=max_k {
-            let col_size_u: u128 = (1u128 << (k as u32))
-                .saturating_sub(super::RESERVED_BLINDING_ROWS as u128);
+            let col_size_u: u128 =
+                (1u128 << (k as u32)).saturating_sub(super::RESERVED_BLINDING_ROWS as u128);
             if col_size_u == 0 {
                 continue;
             }
@@ -197,7 +199,6 @@ impl GraphCircuit {
         let range_len_usize = usize::try_from(range_len_u).unwrap_or(usize::MAX);
         Err(GraphError::LookupRangeTooLarge(range_len_usize))
     }
-
 
     pub fn save(&self, path: std::path::PathBuf) -> Result<(), GraphError> {
         let f = File::create(&path).map_err(|e| {
@@ -223,7 +224,10 @@ impl GraphCircuit {
         Ok(c)
     }
 
-    pub fn from_run_args(run_args: &crate::RunArgs, model_path: &std::path::Path) -> Result<Self, GraphError> {
+    pub fn from_run_args(
+        run_args: &crate::RunArgs,
+        model_path: &std::path::Path,
+    ) -> Result<Self, GraphError> {
         let model = Model::from_run_args(run_args, model_path)?;
 
         let mut settings = model.gen_params(run_args, run_args.check_mode)?;
@@ -298,11 +302,8 @@ impl GraphCircuit {
         let mut out = Vec::with_capacity(input_shapes.len());
 
         for (i, shape) in input_shapes.iter().enumerate() {
-            let flat: Vec<FileSourceInner> = data
-                .input_data
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| vec![]);
+            let flat: Vec<FileSourceInner> =
+                data.input_data.get(i).cloned().unwrap_or_else(|| vec![]);
 
             let scale = self
                 .settings
@@ -328,9 +329,14 @@ impl GraphCircuit {
         srs: Option<&Scheme::ParamsProver>,
         region_settings: crate::circuit::region::RegionSettings,
     ) -> Result<GraphWitness, GraphError> {
-        let res = self.model.forward(inputs, &self.settings.run_args, region_settings)?;
+        let res = self
+            .model
+            .forward(inputs, &self.settings.run_args, region_settings)?;
 
-        let witness_inputs = inputs.iter().map(|t| t.clone().into_iter().collect()).collect();
+        let witness_inputs = inputs
+            .iter()
+            .map(|t| t.clone().into_iter().collect())
+            .collect();
         let witness_outputs: Vec<Vec<Fp>> = res
             .outputs
             .iter()
@@ -339,28 +345,41 @@ impl GraphCircuit {
 
         let params = self.model.get_all_params();
 
-        let processed_inputs: Option<ModuleForwardResult> = if self.model.visibility.input.requires_processing() {
-            Some(GraphModules::forward::<Scheme>(
-                &inputs.iter().cloned().collect_vec(),
-                &self.model.visibility.input,
-                vk,
-                srs,
-            )?)
-        } else {
-            None
-        };
+        let processed_inputs: Option<ModuleForwardResult> =
+            if self.model.visibility.input.requires_processing() {
+                Some(GraphModules::forward::<Scheme>(
+                    &inputs.iter().cloned().collect_vec(),
+                    &self.model.visibility.input,
+                    vk,
+                    srs,
+                )?)
+            } else {
+                None
+            };
 
-        let processed_params: Option<ModuleForwardResult> = if self.model.visibility.params.requires_processing() {
-            Some(GraphModules::forward::<Scheme>(&params, &self.model.visibility.params, vk, srs)?)
-        } else {
-            None
-        };
+        let processed_params: Option<ModuleForwardResult> =
+            if self.model.visibility.params.requires_processing() {
+                Some(GraphModules::forward::<Scheme>(
+                    &params,
+                    &self.model.visibility.params,
+                    vk,
+                    srs,
+                )?)
+            } else {
+                None
+            };
 
-        let processed_outputs: Option<ModuleForwardResult> = if self.model.visibility.output.requires_processing() {
-            Some(GraphModules::forward::<Scheme>(&res.outputs, &self.model.visibility.output, vk, srs)?)
-        } else {
-            None
-        };
+        let processed_outputs: Option<ModuleForwardResult> =
+            if self.model.visibility.output.requires_processing() {
+                Some(GraphModules::forward::<Scheme>(
+                    &res.outputs,
+                    &self.model.visibility.output,
+                    vk,
+                    srs,
+                )?)
+            } else {
+                None
+            };
 
         Ok(GraphWitness {
             inputs: witness_inputs,
@@ -417,7 +436,10 @@ impl GraphCircuit {
         Ok(instances)
     }
 
-    pub fn pretty_public_inputs(&self, witness: &GraphWitness) -> Result<crate::pfsys::PrettyElements, GraphError> {
+    pub fn pretty_public_inputs(
+        &self,
+        witness: &GraphWitness,
+    ) -> Result<crate::pfsys::PrettyElements, GraphError> {
         let mut w = witness.clone();
         w.generate_rescaled_elements(
             self.settings.model_input_scales.clone(),
@@ -442,13 +464,15 @@ impl Circuit<Fp> for GraphCircuit {
     fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
         // GraphCircuit config depends on GraphSettings; we thread it through a
         // thread-local (GLOBAL_SETTINGS) because Halo2's Circuit::configure has no `&self`.
-        let params = super::GLOBAL_SETTINGS.with(|gs| gs.borrow().clone()).unwrap_or_else(|| {
-            panic!(
+        let params = super::GLOBAL_SETTINGS
+            .with(|gs| gs.borrow().clone())
+            .unwrap_or_else(|| {
+                panic!(
                 "GLOBAL_SETTINGS not set. Load settings via GraphSettings::load() or construct \
                  GraphCircuit via GraphCircuit::load()/from_run_args()/from_settings() before \
                  invoking Halo2 keygen/prove/verify."
             )
-        });
+            });
 
         // Configure modules (poseidon/polycommit) if visibility requires it.
         let module_sizes: ModuleSizes = params.module_sizes.clone();
@@ -489,7 +513,10 @@ impl Circuit<Fp> for GraphCircuit {
         config: Self::Config,
         mut layouter: impl Layouter<Fp>,
     ) -> Result<(), Error> {
-        let GraphCircuitConfig { model: model_cfg, modules: _modules_cfg } = config;
+        let GraphCircuitConfig {
+            model: model_cfg,
+            modules: _modules_cfg,
+        } = config;
 
         // Build per-run vars state (idx/offset changes during layout).
         let mut vars = model_cfg.vars.clone();
@@ -514,7 +541,11 @@ impl Circuit<Fp> for GraphCircuit {
             let len = shape.iter().product::<usize>();
 
             let vt = if let Some(w) = witness_opt {
-                let flat = w.inputs.get(i).cloned().unwrap_or_else(|| vec![Fp::ZERO; len]);
+                let flat = w
+                    .inputs
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| vec![Fp::ZERO; len]);
                 let mut t = Tensor::<Fp>::new(Some(&flat), shape).map_err(|_| Error::Synthesis)?;
                 t.set_visibility(&self.settings.run_args.input_visibility);
                 ValTensor::try_from(t).map_err(|_| Error::Synthesis)?
@@ -530,13 +561,22 @@ impl Circuit<Fp> for GraphCircuit {
         // Prepare witnessed outputs only if outputs are FIXED.
         let mut witnessed_outputs: Vec<ValTensor<Fp>> = vec![];
         if self.settings.run_args.output_visibility.is_fixed() {
-            let out_shapes = self.model.graph.output_shapes().map_err(|_| Error::Synthesis)?;
+            let out_shapes = self
+                .model
+                .graph
+                .output_shapes()
+                .map_err(|_| Error::Synthesis)?;
             for (i, shape) in out_shapes.iter().enumerate() {
                 let len = shape.iter().product::<usize>();
 
                 let vt = if let Some(w) = witness_opt {
-                    let flat = w.outputs.get(i).cloned().unwrap_or_else(|| vec![Fp::ZERO; len]);
-                    let mut t = Tensor::<Fp>::new(Some(&flat), shape).map_err(|_| Error::Synthesis)?;
+                    let flat = w
+                        .outputs
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| vec![Fp::ZERO; len]);
+                    let mut t =
+                        Tensor::<Fp>::new(Some(&flat), shape).map_err(|_| Error::Synthesis)?;
                     t.set_visibility(&self.settings.run_args.output_visibility);
                     ValTensor::try_from(t).map_err(|_| Error::Synthesis)?
                 } else {

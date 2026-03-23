@@ -14,6 +14,39 @@ from .timm_weights import create_timm_model_with_retries
 logger = logging.getLogger(__name__)
 
 
+def _model_env_suffix(model_name: str) -> str:
+    key = (model_name or "").strip().upper()
+    return "".join(ch if ch.isalnum() else "_" for ch in key)
+
+
+def _read_positive_int_env(candidates) -> Optional[int]:
+    for name in candidates:
+        raw = (os.environ.get(name) or "").strip()
+        if not raw:
+            continue
+        try:
+            value = int(raw)
+        except Exception:
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _resolve_model_input_side(model_key: str, default: int) -> int:
+    suffix = _model_env_suffix(model_key)
+    hit = _read_positive_int_env(
+        [
+            f"EZKL_BENCH_INPUT_SIDE_{suffix}",
+            "EZKL_BENCH_INPUT_SIDE",
+        ]
+    )
+    if hit is not None:
+        logger.info("Using input side override from environment for %s: %s", model_key, hit)
+        return int(hit)
+    return int(default)
+
+
 class LeNet5(nn.Module):
     """
     Classic-ish LeNet-5.
@@ -226,14 +259,15 @@ def get_vit_tiny_pretrained(cache_dir: Path) -> Tuple[nn.Module, torch.Tensor]:
     return model, dummy_input
 
 
-def get_repvgg_a0_pretrained(cache_dir: Path) -> Tuple[nn.Module, torch.Tensor]:
+def get_repvgg_a0_pretrained(cache_dir: Path, input_side: Optional[int] = None) -> Tuple[nn.Module, torch.Tensor]:
     model = _create_timm_model_best_effort("repvgg_a0", cache_dir=cache_dir)
 
     if hasattr(model, "switch_to_deploy"):
         model.switch_to_deploy()
     model.eval()
 
-    dummy_input = _get_mnist_sample(cache_dir, 224, channels=3)
+    actual_side = int(input_side) if input_side is not None else _resolve_model_input_side("repvgg_a0", 96)
+    dummy_input = _get_mnist_sample(cache_dir, actual_side, channels=3)
     return model, dummy_input
 
 
@@ -275,10 +309,12 @@ class ModelSpec:
     input_scale: int = 7
     param_scale: int = 7
     num_inner_cols: int = 2
+    input_side: Optional[int] = None
 
     enable_onnx_split: bool = False
     split_min_params: Optional[int] = None
     split_max_nodes: Optional[int] = None
+    split_retry_budget: Optional[int] = None
     max_segment_logrows: Optional[int] = None
     max_segment_rows: Optional[int] = None
     max_segment_assignments: Optional[int] = None
@@ -296,6 +332,8 @@ def get_model_specs(cache_dir: Path) -> Dict[str, ModelSpec]:
     Note: we keep backwards-compatible keys (lenet/repvgg/etc.), and also provide
     aliases matching the new benchmark naming ('lenet-5-small', 'repvgg-a0').
     """
+    repvgg_input_side = _resolve_model_input_side("repvgg_a0", 96)
+
     specs: Dict[str, ModelSpec] = {
         "lenet": ModelSpec(
             key="lenet",
@@ -303,6 +341,7 @@ def get_model_specs(cache_dir: Path) -> Dict[str, ModelSpec]:
             factory=lambda: get_lenet5_pretrained(cache_dir, input_side=16),
             input_scale=3,
             param_scale=3,
+            input_side=16,
             enable_onnx_split=False,
             precision="fp32",
             rewrite_gemm=True,
@@ -313,6 +352,7 @@ def get_model_specs(cache_dir: Path) -> Dict[str, ModelSpec]:
             factory=lambda: get_lenet5_pretrained(cache_dir, input_side=32),
             input_scale=3,
             param_scale=3,
+            input_side=32,
             enable_onnx_split=False,
             precision="fp32",
             rewrite_gemm=True,
@@ -333,6 +373,7 @@ def get_model_specs(cache_dir: Path) -> Dict[str, ModelSpec]:
             factory=lambda: get_vit_tiny_pretrained(cache_dir),
             input_scale=3,
             param_scale=3,
+            input_side=224,
             num_inner_cols=16,
             enable_onnx_split=True,
             precision=None,
@@ -341,13 +382,15 @@ def get_model_specs(cache_dir: Path) -> Dict[str, ModelSpec]:
         "repvgg": ModelSpec(
             key="repvgg",
             display_name="RepVGG-A0",
-            factory=lambda: get_repvgg_a0_pretrained(cache_dir),
-            input_scale=3,
-            param_scale=3,
+            factory=lambda: get_repvgg_a0_pretrained(cache_dir, input_side=repvgg_input_side),
+            input_scale=2,
+            param_scale=2,
+            input_side=repvgg_input_side,
             num_inner_cols=8,
             enable_onnx_split=True,
             split_min_params=10_000,
-            split_max_nodes=12,
+            split_max_nodes=3,
+            split_retry_budget=2,
             max_segment_logrows=23,
             max_segment_rows=8_000_000,
             max_segment_assignments=64_000_000,
@@ -363,6 +406,7 @@ def get_model_specs(cache_dir: Path) -> Dict[str, ModelSpec]:
         factory=lambda: get_lenet5_pretrained(cache_dir, input_side=16),
         input_scale=3,
         param_scale=3,
+        input_side=16,
         enable_onnx_split=False,
         precision="fp32",
         rewrite_gemm=True,
@@ -370,13 +414,15 @@ def get_model_specs(cache_dir: Path) -> Dict[str, ModelSpec]:
     specs["repvgg-a0"] = ModelSpec(
         key="repvgg-a0",
         display_name="RepVGG-A0",
-        factory=lambda: get_repvgg_a0_pretrained(cache_dir),
-        input_scale=3,
-        param_scale=3,
+        factory=lambda: get_repvgg_a0_pretrained(cache_dir, input_side=repvgg_input_side),
+        input_scale=2,
+        param_scale=2,
+        input_side=repvgg_input_side,
         num_inner_cols=8,
         enable_onnx_split=True,
         split_min_params=10_000,
-        split_max_nodes=12,
+        split_max_nodes=3,
+        split_retry_budget=2,
         max_segment_logrows=23,
         max_segment_rows=8_000_000,
         max_segment_assignments=64_000_000,

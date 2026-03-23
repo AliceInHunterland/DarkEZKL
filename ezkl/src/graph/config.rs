@@ -60,7 +60,12 @@ pub enum ExecutionMode {
 /// Operators eligible for probabilistic execution (Freivalds-style checks).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ProbOp {
-    #[serde(rename = "matmul", alias = "mat_mul", alias = "MatMul", alias = "MATMUL")]
+    #[serde(
+        rename = "matmul",
+        alias = "mat_mul",
+        alias = "MatMul",
+        alias = "MATMUL"
+    )]
     MatMul,
     #[serde(rename = "gemm", alias = "Gemm", alias = "GEMM")]
     Gemm,
@@ -614,8 +619,7 @@ impl<'de> Deserialize<'de> for GraphSettings {
                     }
                 }
 
-                let mut run_args =
-                    run_args.ok_or_else(|| de::Error::missing_field("run_args"))?;
+                let mut run_args = run_args.ok_or_else(|| de::Error::missing_field("run_args"))?;
 
                 // Determine execution mode:
                 // * prefer top-level execution_mode
@@ -934,7 +938,7 @@ impl GraphSettings {
             .ceil() as u32
     }
 
-     pub fn dynamic_lookup_and_shuffle_col_size(&self) -> usize {
+    pub fn dynamic_lookup_and_shuffle_col_size(&self) -> usize {
         self.dynamic_lookup_params.total_dynamic_col_size
             + self.shuffle_params.total_shuffle_col_size
     }
@@ -1008,7 +1012,7 @@ impl GraphSettings {
     pub fn save(&self, path: &std::path::PathBuf) -> Result<(), std::io::Error> {
         // buf writer
         let writer =
-           std::io::BufWriter::with_capacity(EZKL_BUF_CAPACITY, std::fs::File::create(path)?);
+            std::io::BufWriter::with_capacity(EZKL_BUF_CAPACITY, std::fs::File::create(path)?);
         serde_json::to_writer(writer, &self).map_err(|e| {
             error!("failed to save settings file at {}", e);
             std::io::Error::other(e)
@@ -1026,7 +1030,7 @@ impl GraphSettings {
         })?;
 
         crate::check_version_string_matches(&settings.version);
- // Keep the thread-local GLOBAL_SETTINGS in sync so circuit configuration can access it.
+        // Keep the thread-local GLOBAL_SETTINGS in sync so circuit configuration can access it.
         GLOBAL_SETTINGS.with(|gs| {
             *gs.borrow_mut() = Some(settings.clone());
         });

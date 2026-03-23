@@ -67,9 +67,9 @@ impl FromStr for Visibility {
 
         if raw.to_lowercase().starts_with("hashed/private") {
             // Expected: hashed/private/<csv outlets>
-            let (_, outlets_part) = raw
-                .rsplit_once('/')
-                .ok_or_else(|| "hashed/private visibility must include outlets: hashed/private/0,1".to_string())?;
+            let (_, outlets_part) = raw.rsplit_once('/').ok_or_else(|| {
+                "hashed/private visibility must include outlets: hashed/private/0,1".to_string()
+            })?;
 
             let outlets = if outlets_part.trim().is_empty() {
                 vec![]

@@ -72,7 +72,8 @@ pub fn analyze_einsum_usage(
     let mut reduction_length = 0;
 
     for ((_, equation), input_axes_to_dim) in equations.iter() {
-        let analysis = analyze_single_equation_with_settings(equation, input_axes_to_dim, settings)?;
+        let analysis =
+            analyze_single_equation_with_settings(equation, input_axes_to_dim, settings)?;
         max_input_size = max_input_size.max(analysis.max_input_size);
         max_output_size = max_output_size.max(analysis.output_size);
         max_num_inputs = max_num_inputs.max(analysis.num_inputs);
@@ -282,7 +283,8 @@ fn is_matmul_candidate_for_freivalds(equation: &str) -> bool {
     let c_axes: Vec<char> = eq.c_indices.chars().collect();
 
     // Reject duplicate axes within an operand (diagonal / trace semantics).
-    if has_duplicate_chars(&a_axes) || has_duplicate_chars(&b_axes) || has_duplicate_chars(&c_axes) {
+    if has_duplicate_chars(&a_axes) || has_duplicate_chars(&b_axes) || has_duplicate_chars(&c_axes)
+    {
         return false;
     }
 

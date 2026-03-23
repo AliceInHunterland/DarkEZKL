@@ -42,12 +42,12 @@ mod probabilistic_matmul {
         multiopen::{ProverSHPLONK, VerifierSHPLONK},
         strategy::SingleStrategy,
     };
-    use halo2_proofs::transcript::{Blake2bWrite, Blake2bRead, Challenge255};
+    use halo2_proofs::transcript::{Blake2bRead, Blake2bWrite, Challenge255};
     use halo2curves::bn256::G1Affine;
     use std::io::Cursor;
 
-    use crate::commands::{ExecutionMode, ProbOp, ProbOps, RunArgs};
     use crate::circuit::ops::probabilistic::FreivaldsCheck;
+    use crate::commands::{ExecutionMode, ProbOp, ProbOps, RunArgs};
 
     const K: usize = 8;
     const LEN: usize = 2;
@@ -200,7 +200,7 @@ mod probabilistic_matmul {
             &pk,
             // Safe mode: ensures the generated proof verifies correctly under the selected execution mode.
             CheckMode::SAFE,
-            None,  // No proof splitting in tests
+            None, // No proof splitting in tests
             None,
         );
 
@@ -265,7 +265,7 @@ mod probabilistic_matmul {
             &params,
             &pk,
             CheckMode::SAFE,
-            None,  // No proof splitting in tests
+            None, // No proof splitting in tests
             None,
         );
 

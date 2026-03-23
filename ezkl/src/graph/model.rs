@@ -158,9 +158,7 @@ fn log_probabilistic_soundness_budget(run_args: &RunArgs, dummy_res: &DummyPassR
             "execution_mode=probabilistic but estimated probabilistic check count is 0 \
              (no einsum equations were recorded by dummy layout). \
              prob_ops={}, seed_mode={}, k_repetitions={}.",
-            run_args.prob_ops,
-            run_args.prob_seed_mode,
-            k
+            run_args.prob_ops, run_args.prob_seed_mode, k
         );
         return;
     }
@@ -1495,10 +1493,11 @@ impl Model {
                         // That hides the real root-cause from `ezkl gen-settings`, since settings
                         // generation runs the model through a dummy layout pass.
                         let op = n.opkind.as_string();
-                        match config
-                            .base
-                            .layout(region, &values.iter().collect_vec(), n.opkind.clone_dyn())
-                        {
+                        match config.base.layout(
+                            region,
+                            &values.iter().collect_vec(),
+                            n.opkind.clone_dyn(),
+                        ) {
                             Ok(v) => v,
                             Err(e) => {
                                 return Err(GraphError::OpLayoutError {

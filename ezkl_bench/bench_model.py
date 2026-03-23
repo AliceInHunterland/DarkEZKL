@@ -158,6 +158,7 @@ def _segment_cache_key(
     calibration_knobs: Dict[str, Any],
     skip_mock: bool,
     skip_verify: bool,
+    output_visibility: str,
 ) -> Dict[str, Any]:
     check_mode = (os.environ.get("EZKL_CHECK_MODE") or "safe").strip().lower()
     ignore_io_range = env_flag("EZKL_IGNORE_RANGE_CHECK_IO", default=(check_mode == "unsafe"))
@@ -173,6 +174,7 @@ def _segment_cache_key(
             "num_inner_cols": int(effective_num_inner_cols),
             "explicit_logrows": None if explicit_logrows is None else int(explicit_logrows),
             "check_mode": check_mode,
+            "output_visibility": str(output_visibility),
             "ignore_range_check_inputs_outputs": bool(ignore_io_range),
             "prob_overrides": {
                 "execution_mode": prob_overrides.get("execution_mode"),
@@ -536,6 +538,8 @@ def _effective_split_retry_budget(spec: ModelSpec) -> int:
         name, value = hit
         logger.info("Using split retry budget override from %s=%s for model=%s", name, value, spec.key)
         return value
+    if spec.split_retry_budget is not None:
+        return int(spec.split_retry_budget)
     return 3 if spec.enable_onnx_split else 0
 
 
@@ -572,6 +576,30 @@ def _tighten_split_tuning(current: SplitTuning) -> Optional[SplitTuning]:
             max_rows=current.max_rows,
             max_assignments=current.max_assignments,
         )
+    if current.max_nodes > 3:
+        return SplitTuning(
+            min_params=current.min_params,
+            max_nodes=3,
+            max_logrows=current.max_logrows,
+            max_rows=current.max_rows,
+            max_assignments=current.max_assignments,
+        )
+    if current.max_nodes > 2:
+        return SplitTuning(
+            min_params=current.min_params,
+            max_nodes=2,
+            max_logrows=current.max_logrows,
+            max_rows=current.max_rows,
+            max_assignments=current.max_assignments,
+        )
+    if current.max_nodes > 1:
+        return SplitTuning(
+            min_params=current.min_params,
+            max_nodes=1,
+            max_logrows=current.max_logrows,
+            max_rows=current.max_rows,
+            max_assignments=current.max_assignments,
+        )
     next_min_params = max(1_000, int(current.min_params) // 2)
     if next_min_params < int(current.min_params):
         return SplitTuning(
@@ -583,8 +611,40 @@ def _tighten_split_tuning(current: SplitTuning) -> Optional[SplitTuning]:
         )
     return None
 
+def _effective_output_visibility(*, segment_pos: int, segment_count: int) -> str:
+    if segment_count > 1 and segment_pos < (segment_count - 1):
+        return "private"
+    return "public"
 
-def _mk_run_args(spec: ModelSpec, explicit_logrows: Optional[int]) -> Optional[Any]:
+
+def _enforce_settings_output_visibility(settings_path: Path, output_visibility: str) -> None:
+    try:
+        settings = read_json(settings_path)
+    except Exception as e:
+        logger.warning("Unable to read settings for output_visibility enforcement (%s): %s", settings_path, e)
+        return
+
+    run_args = settings.get("run_args")
+    if not isinstance(run_args, dict):
+        logger.warning("Skipping output_visibility enforcement for malformed settings: %s", settings_path)
+        return
+
+    desired = str(output_visibility).capitalize()
+    current = str(run_args.get("output_visibility") or "")
+    if current == desired:
+        return
+
+    logger.info(
+        "Rewriting settings output_visibility for %s: %s -> %s",
+        settings_path,
+        current or "<missing>",
+        desired,
+    )
+    run_args["output_visibility"] = desired
+    write_json(settings_path, settings)
+
+
+def _mk_run_args(spec: ModelSpec, explicit_logrows: Optional[int], output_visibility: str) -> Optional[Any]:
     import ezkl
 
     run_args_cls = getattr(ezkl, "PyRunArgs", None) or getattr(ezkl, "RunArgs", None)
@@ -600,15 +660,15 @@ def _mk_run_args(spec: ModelSpec, explicit_logrows: Optional[int]) -> Optional[A
     if hasattr(ezkl, "PyVisibility"):
         try:
             run_args.input_visibility = ezkl.PyVisibility.Private
-            run_args.output_visibility = ezkl.PyVisibility.Public
+            run_args.output_visibility = getattr(ezkl.PyVisibility, str(output_visibility).capitalize())
             run_args.param_visibility = ezkl.PyVisibility.Fixed
         except Exception:
             run_args.input_visibility = "private"
-            run_args.output_visibility = "public"
+            run_args.output_visibility = str(output_visibility)
             run_args.param_visibility = "fixed"
     else:
         run_args.input_visibility = "private"
-        run_args.output_visibility = "public"
+        run_args.output_visibility = str(output_visibility)
         run_args.param_visibility = "fixed"
 
     # --- performance/defensiveness knobs (best-effort) ---
@@ -663,6 +723,7 @@ def _build_gen_settings_cli(
     settings_path: Path,
     explicit_logrows: Optional[int],
     prob_overrides: Dict[str, Any],
+    output_visibility: str,
 ) -> List[str]:
     input_scale = _effective_input_scale(spec)
     param_scale = _effective_param_scale(spec)
@@ -682,7 +743,7 @@ def _build_gen_settings_cli(
         "--input-visibility",
         "private",
         "--output-visibility",
-        "public",
+        str(output_visibility),
         "--param-visibility",
         "fixed",
         "--check-mode",
@@ -762,7 +823,9 @@ def _calibration_knobs_from_env() -> Dict[str, Any]:
 def _run_single_onnx_pipeline(
     *,
     spec: ModelSpec,
+    segment_pos: int,
     segment_idx: int,
+    segment_count: int,
     onnx_path: Path,
     input_json_payload: Dict[str, Any],
     work_dir: Path,
@@ -801,6 +864,9 @@ def _run_single_onnx_pipeline(
     seg_meta["probabilistic_overrides"] = dict(prob_overrides)
     calib_knobs = _calibration_knobs_from_env()
     seg_meta["calibration_knobs"] = dict(calib_knobs)
+    output_visibility = _effective_output_visibility(segment_pos=segment_pos, segment_count=segment_count)
+    seg_meta["output_visibility"] = output_visibility
+    seg_meta["segment_position"] = int(segment_pos)
     eff_input_scale = _effective_input_scale(spec)
     eff_param_scale = _effective_param_scale(spec)
     eff_num_inner_cols = _effective_num_inner_cols(spec)
@@ -830,6 +896,7 @@ def _run_single_onnx_pipeline(
         calibration_knobs=calib_knobs,
         skip_mock=skip_mock,
         skip_verify=skip_verify,
+        output_visibility=output_visibility,
     )
     cached_segment = _load_cached_segment_result(
         work_dir=work_dir,
@@ -842,28 +909,31 @@ def _run_single_onnx_pipeline(
         return cached_segment
 
     logger.info("Generating settings (work_dir=%s)...", work_dir)
-    run_args = _mk_run_args(spec=spec, explicit_logrows=explicit_logrows)
+    run_args = _mk_run_args(spec=spec, explicit_logrows=explicit_logrows, output_visibility=output_visibility)
 
     if run_args is not None:
         logger.info(
             "RunArgs: input_scale=%s param_scale=%s num_inner_cols=%s explicit_logrows=%s "
-            "check_mode=%s ignore_range_check_inputs_outputs=%s prob_overrides=%s",
+            "check_mode=%s ignore_range_check_inputs_outputs=%s output_visibility=%s prob_overrides=%s",
             getattr(run_args, "input_scale", None),
             getattr(run_args, "param_scale", None),
             getattr(run_args, "num_inner_cols", None),
             explicit_logrows,
             getattr(run_args, "check_mode", None),
             getattr(run_args, "ignore_range_check_inputs_outputs", None),
+            output_visibility,
             prob_overrides,
         )
     else:
         logger.info(
             "RunArgs unavailable in Python binding; using CLI fallback. "
-            "spec_input_scale=%s spec_param_scale=%s spec_num_inner_cols=%s explicit_logrows=%s prob_overrides=%s",
+            "spec_input_scale=%s spec_param_scale=%s spec_num_inner_cols=%s explicit_logrows=%s "
+            "output_visibility=%s prob_overrides=%s",
             eff_input_scale,
             eff_param_scale,
             eff_num_inner_cols,
             explicit_logrows,
+            output_visibility,
             prob_overrides,
         )
 
@@ -885,6 +955,7 @@ def _run_single_onnx_pipeline(
                     settings_path=settings_path,
                     explicit_logrows=explicit_logrows,
                     prob_overrides=prob_overrides,
+                    output_visibility=output_visibility,
                 )
             )
             ok = True
@@ -933,6 +1004,7 @@ def _run_single_onnx_pipeline(
     seg_meta["gen_settings_time_s"] = float(t["elapsed"] or 0.0)
     if not ok:
         raise RuntimeError("ezkl.gen_settings returned false")
+    _enforce_settings_output_visibility(settings_path, output_visibility)
     seg_meta["settings"] = _path_stats(settings_path)
 
     logger.info("Calibrating settings (work_dir=%s)...", work_dir)
@@ -990,6 +1062,7 @@ def _run_single_onnx_pipeline(
     seg_meta["calibrate_time_s"] = float(t["elapsed"] or 0.0)
     if not ok:
         raise RuntimeError("ezkl.calibrate_settings returned false")
+    _enforce_settings_output_visibility(settings_path, output_visibility)
 
     settings = read_json(settings_path)
     seg_logrows = int(settings["run_args"]["logrows"])
@@ -1459,6 +1532,23 @@ def run_single_model(
     else:
         split_enabled = bool(split_onnx) and bool(spec.enable_onnx_split)
 
+    execution_mode = (os.environ.get("EZKL_EXECUTION_MODE") or "exact").strip().lower()
+    auto_skip_mock = bool(split_enabled) and execution_mode == "probabilistic"
+    requested_skip_mock = bool(skip_mock)
+    effective_skip_mock = requested_skip_mock or auto_skip_mock
+    if auto_skip_mock and not requested_skip_mock:
+        logger.info(
+            "Forcing skip_mock=True for split+probabilistic run (model=%s, execution_mode=%s)",
+            spec.display_name,
+            execution_mode,
+        )
+
+    result.diagnostics["skip_mock"] = {
+        "requested": requested_skip_mock,
+        "effective": effective_skip_mock,
+        "forced_split_probabilistic": bool(auto_skip_mock and not requested_skip_mock),
+    }
+
     try:
         result.diagnostics["system_start"] = get_system_stats([Path("/app"), artifacts_root, cache_root])
         logger.info(
@@ -1482,7 +1572,7 @@ def run_single_model(
             "Runtime env: ENABLE_ICICLE_GPU=%s ICICLE_SMALL_K=%s SPLIT_ONNX(global)=%s SPLIT_ONNX(actual)=%s "
             "SPLIT_MIN_PARAMS=%s SPLIT_MAX_NODES=%s EZKL_ONNX_PRECISION=%s EZKL_CHECK_MODE=%s EZKL_LOOKUP_SAFETY_MARGIN=%s "
             "EZKL_EXECUTION_MODE=%s EZKL_PROB_K=%s EZKL_PROB_OPS=%s EZKL_PROB_SEED_MODE=%s "
-            "skip_mock=%s skip_verify=%s",
+            "skip_mock(requested/effective)=%s/%s skip_verify=%s",
             os.environ.get("ENABLE_ICICLE_GPU"),
             os.environ.get("ICICLE_SMALL_K"),
             split_onnx,
@@ -1496,7 +1586,8 @@ def run_single_model(
             os.environ.get("EZKL_PROB_K"),
             os.environ.get("EZKL_PROB_OPS"),
             os.environ.get("EZKL_PROB_SEED_MODE"),
-            skip_mock,
+            requested_skip_mock,
+            effective_skip_mock,
             skip_verify,
         )
 
@@ -1521,6 +1612,7 @@ def run_single_model(
 
         # Keep numpy input for ONNXRuntime splitting flow
         dummy_np = dummy.detach().cpu().numpy()
+        result.diagnostics["model_input_shape"] = [int(x) for x in dummy.shape]
 
         # Free model memory ASAP before Rust-heavy ezkl steps
         try:
@@ -1690,7 +1782,7 @@ def run_single_model(
                 )
 
             try:
-                for seg in segments_ezkl:
+                for seg_pos, seg in enumerate(segments_ezkl):
                     seg_path = Path(seg.onnx_path)
                     seg_work_dir = ensure_dir(model_dir / "segments" / f"seg_{seg.idx:03d}")
                     logger.info(
@@ -1705,9 +1797,11 @@ def run_single_model(
 
                     seg_meta, seg_prove, seg_verify = _run_single_onnx_pipeline(
                         spec=spec,
+                        segment_pos=seg_pos,
                         segment_idx=seg.idx,
+                        segment_count=len(segments_ezkl),
                         onnx_path=seg_path,
-                        input_json_payload=seg_inputs_payloads[seg.idx],
+                        input_json_payload=seg_inputs_payloads[seg_pos],
                         work_dir=seg_work_dir,
                         artifacts_root=artifacts_root,
                         repeats=repeats,
@@ -1715,7 +1809,7 @@ def run_single_model(
                         explicit_logrows=explicit_logrows,
                         split_tuning=current_split_tuning if split_enabled else None,
                         skip_verify=skip_verify,
-                        skip_mock=skip_mock,
+                        skip_mock=effective_skip_mock,
                     )
 
                     seg_meta["segment_idx"] = seg.idx

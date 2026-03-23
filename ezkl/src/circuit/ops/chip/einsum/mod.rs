@@ -2,12 +2,14 @@ use crate::circuit::base::BaseOp;
 use crate::circuit::layouts::einsum_with_base_ops;
 use crate::circuit::region::RegionCtx;
 use crate::circuit::{BaseConfig, CheckMode, CircuitError};
-use crate::graph::config::{GLOBAL_SETTINGS, ProbOp, ProbOps};
+use crate::graph::config::{ProbOp, ProbOps, GLOBAL_SETTINGS};
 use crate::tensor::{Tensor, TensorError, TensorType, ValTensor, ValType, VarTensor};
 use crate::{ExecutionMode, ProbabilisticSettings};
 use analysis::{analyze_single_equation, EinsumAnalysis};
 use halo2_proofs::circuit::Value;
-use halo2_proofs::plonk::{Challenge, ConstraintSystem, Constraints, Expression, FirstPhase, Selector};
+use halo2_proofs::plonk::{
+    Challenge, ConstraintSystem, Constraints, Expression, FirstPhase, Selector,
+};
 use halo2curves::ff::PrimeField;
 use itertools::Itertools;
 use layouts::{dot, multi_dot, pairwise, prod, sum};
@@ -90,7 +92,8 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> Einsums<F> {
 
         let mut rlc_gates = vec![];
         for _ in 0..analysis.max_num_output_axes {
-            let rlc_gate = RLCConfig::new(meta, &[inputs[0].clone(), inputs[2].clone()], &outputs[1]);
+            let rlc_gate =
+                RLCConfig::new(meta, &[inputs[0].clone(), inputs[2].clone()], &outputs[1]);
             rlc_gates.push(rlc_gate);
         }
 
@@ -112,7 +115,13 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> Einsums<F> {
         GLOBAL_SETTINGS.with(|gs| {
             gs.borrow()
                 .as_ref()
-                .map(|s| (s.execution_mode, s.probabilistic_settings, s.prob_ops.clone()))
+                .map(|s| {
+                    (
+                        s.execution_mode,
+                        s.probabilistic_settings,
+                        s.prob_ops.clone(),
+                    )
+                })
                 .unwrap_or((
                     ExecutionMode::Exact,
                     ProbabilisticSettings::default(),
@@ -170,7 +179,8 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> Einsums<F> {
             .zip(input_tensors.iter())
             .for_each(|(indices, tensor)| {
                 indices.chars().zip(tensor.dims()).for_each(|(index, dim)| {
-                    if let std::collections::hash_map::Entry::Vacant(e) = input_axes_to_dim.entry(index)
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        input_axes_to_dim.entry(index)
                     {
                         e.insert(*dim);
                     }
@@ -187,7 +197,10 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> Einsums<F> {
             .collect::<Result<Vec<_>, TensorError>>()?;
         output_tensor.remove_trivial_axes()?;
 
-        if matches!(equation_analysis.strategy, analysis::EinsumStrategy::BaseOps) {
+        if matches!(
+            equation_analysis.strategy,
+            analysis::EinsumStrategy::BaseOps
+        ) {
             let _ = einsum_with_base_ops(
                 base_config,
                 region,
@@ -211,7 +224,10 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> Einsums<F> {
             && prob_settings.k_repetitions > 0;
 
         if prob_enabled_for_matmul
-            && matches!(equation_analysis.strategy, analysis::EinsumStrategy::Freivalds)
+            && matches!(
+                equation_analysis.strategy,
+                analysis::EinsumStrategy::Freivalds
+            )
             && input_tensors.len() == 2
         {
             if let Some(matmul_eq) = MatMulEquation::parse(&equation) {
@@ -245,7 +261,8 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> Einsums<F> {
             .map(|c| input_axes_to_dim.get(c).copied().unwrap())
             .collect_vec();
 
-        let squashed_output = self.assign_output(region, &output_tensor, output_shape, check_mode)?;
+        let squashed_output =
+            self.assign_output(region, &output_tensor, output_shape, check_mode)?;
 
         // reorder the reduction of input tensors and reduce
         let reordered_input_reductions = reduction_planner::input_reductions(&equation).unwrap();
@@ -274,7 +291,8 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> Einsums<F> {
                 .map(|idx| tensors[*idx].clone())
                 .collect_vec();
 
-            let mut flattened_input_tensors: Vec<Vec<ValTensor<F>>> = vec![vec![]; input_tensors.len()];
+            let mut flattened_input_tensors: Vec<Vec<ValTensor<F>>> =
+                vec![vec![]; input_tensors.len()];
             for remaining_axes_indices in remaining_axes_indices {
                 // corresponds to 1 running sum of input tensors
                 for (i, (input_tensor, input_expr)) in
@@ -283,7 +301,8 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> Einsums<F> {
                     let mut sliced_dim = vec![];
                     input_expr.chars().for_each(|axis| {
                         if let Some(pos) = remaining_axes.iter().position(|c| *c == axis) {
-                            sliced_dim.push(remaining_axes_indices[pos]..remaining_axes_indices[pos] + 1);
+                            sliced_dim
+                                .push(remaining_axes_indices[pos]..remaining_axes_indices[pos] + 1);
                         } else {
                             // common axis
                             sliced_dim.push(0..input_axes_to_dim[&axis]);
@@ -306,7 +325,10 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> Einsums<F> {
                 })
                 .collect_vec();
 
-            let output_dims = output_expr.chars().map(|c| input_axes_to_dim[&c]).collect_vec();
+            let output_dims = output_expr
+                .chars()
+                .map(|c| input_axes_to_dim[&c])
+                .collect_vec();
 
             let contracted_output = match reduction {
                 Reduction::RLC {
@@ -328,7 +350,9 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> Einsums<F> {
                     result.reshape(&output_dims)?;
                     result
                 }
-                Reduction::Contraction { axis, input_phases, .. } => match axis {
+                Reduction::Contraction {
+                    axis, input_phases, ..
+                } => match axis {
                     Some(axis) => {
                         let dot_product_len = input_axes_to_dim[axis];
                         assign_input_contraction(
@@ -402,12 +426,20 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> Einsums<F> {
             let rlc_len = output_shape[output_shape.len() - idx - 1];
             intermediate_values.flatten();
             let phase = if idx > 0 { 1 } else { 0 };
-            intermediate_values =
-                rlc_config.assign_rlc(region, &intermediate_values, *challenge, rlc_len, phase, check_mode)?;
+            intermediate_values = rlc_config.assign_rlc(
+                region,
+                &intermediate_values,
+                *challenge,
+                rlc_len,
+                phase,
+                check_mode,
+            )?;
         }
 
         let phase = if challenges.len() > 0 { 1 } else { 0 };
-        let output_var = self.contraction_gate.get_output_var([phase].as_slice().into());
+        let output_var = self
+            .contraction_gate
+            .get_output_var([phase].as_slice().into());
         let res = region.assign_einsum(output_var, &intermediate_values)?;
         region.increment_einsum_col_coord(1);
 
@@ -427,7 +459,14 @@ fn assign_pairwise_mult<F: PrimeField + TensorType + PartialOrd + std::hash::Has
         .zip(input_phases.iter().cloned())
         .reduce(|(acc, acc_phase), (input, phase)| {
             (
-                pairwise(config, region, &[&acc, &input], BaseOp::Mult, &[acc_phase, phase]).unwrap(),
+                pairwise(
+                    config,
+                    region,
+                    &[&acc, &input],
+                    BaseOp::Mult,
+                    &[acc_phase, phase],
+                )
+                .unwrap(),
                 std::cmp::max(acc_phase, phase),
             )
         })
@@ -456,7 +495,13 @@ fn assign_input_contraction<F: PrimeField + TensorType + PartialOrd + std::hash:
         let result = if tensors.len() == 1 {
             sum(config, region, &[&tensors[0]], input_phases[0], check_mode)?
         } else if tensors.len() == 2 {
-            dot(config, region, &[&tensors[0], &tensors[1]], &[input_phases[0], input_phases[1]], check_mode)?
+            dot(
+                config,
+                region,
+                &[&tensors[0], &tensors[1]],
+                &[input_phases[0], input_phases[1]],
+                check_mode,
+            )?
         } else {
             multi_dot(
                 config,
@@ -715,7 +760,8 @@ impl<F: PrimeField + TensorType + PartialOrd> ContractionConfig<F> {
                             qis[1].clone(),
                             qis[0].clone(),
                         );
-                        let constraints = vec![expected_output[base_op.op_kind.constraint_idx()].clone() - res];
+                        let constraints =
+                            vec![expected_output[base_op.op_kind.constraint_idx()].clone() - res];
 
                         Constraints::with_selector(selector, constraints)
                     });
@@ -723,10 +769,20 @@ impl<F: PrimeField + TensorType + PartialOrd> ContractionConfig<F> {
             }
         }
 
-        let first_phase_inputs: [VarTensor; 2] =
-            inputs[0].iter().copied().cloned().collect_vec().try_into().unwrap();
-        let second_phase_inputs: [VarTensor; 2] =
-            inputs[1].iter().copied().cloned().collect_vec().try_into().unwrap();
+        let first_phase_inputs: [VarTensor; 2] = inputs[0]
+            .iter()
+            .copied()
+            .cloned()
+            .collect_vec()
+            .try_into()
+            .unwrap();
+        let second_phase_inputs: [VarTensor; 2] = inputs[1]
+            .iter()
+            .copied()
+            .cloned()
+            .collect_vec()
+            .try_into()
+            .unwrap();
 
         Self {
             inputs: [first_phase_inputs, second_phase_inputs],
@@ -880,23 +936,31 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> RLCConfig<F> {
             let assigned_len = {
                 let mut input: ValTensor<F> = tensor.iter().collect_vec().into();
                 input.pad_to_zero_rem(block_width, ValType::Constant(F::ZERO))?;
-                let (_, len) = region.assign_einsum_with_duplication_unconstrained(&self.inputs[phase], &input)?;
+                let (_, len) = region
+                    .assign_einsum_with_duplication_unconstrained(&self.inputs[phase], &input)?;
                 len
             };
             let (assigned_output, assigned_output_len) = {
                 let running_sums = running_sums.into_iter().map(ValType::from).collect_vec();
-                region.assign_einsum_with_duplication_constrained(&self.output, &running_sums.into(), check_mode)?
+                region.assign_einsum_with_duplication_constrained(
+                    &self.output,
+                    &running_sums.into(),
+                    check_mode,
+                )?
             };
 
             (0..assigned_output_len)
                 .map(|i| {
-                    let (block_idx, _, z) =
-                        self.output.cartesian_coord(region.einsum_col_coord() + i * block_width);
+                    let (block_idx, _, z) = self
+                        .output
+                        .cartesian_coord(region.einsum_col_coord() + i * block_width);
                     if z == 0 && i > 0 {
                         return Ok(());
                     }
                     let selector = if i == 0 {
-                        self.selectors.get(&(phase, block_idx)).map(|(init, _)| init)
+                        self.selectors
+                            .get(&(phase, block_idx))
+                            .map(|(init, _)| init)
                     } else {
                         self.selectors.get(&(phase, block_idx)).map(|(_, acc)| acc)
                     };
@@ -918,7 +982,9 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> RLCConfig<F> {
 /// - Supports pure (non-batched) matmul and batched matmul where the batch axes appear in A/B/C.
 /// - Any remaining non-batch axes are flattened into (m,n,p) matrices per batch.
 /// - If the pattern is not supported, returns `CircuitError::UnsupportedOp` so the caller can fall back.
-fn layout_probabilistic_freivalds_matmul<F: PrimeField + TensorType + PartialOrd + std::hash::Hash>(
+fn layout_probabilistic_freivalds_matmul<
+    F: PrimeField + TensorType + PartialOrd + std::hash::Hash,
+>(
     einsums: &Einsums<F>,
     region: &mut RegionCtx<F>,
     a: &ValTensor<F>,
@@ -935,7 +1001,10 @@ fn layout_probabilistic_freivalds_matmul<F: PrimeField + TensorType + PartialOrd
     let c_axes: Vec<char> = eq.c_indices.chars().collect();
 
     // Basic sanity: rank matches number of indices.
-    if a.dims().len() != a_axes.len() || b.dims().len() != b_axes.len() || c.dims().len() != c_axes.len() {
+    if a.dims().len() != a_axes.len()
+        || b.dims().len() != b_axes.len()
+        || c.dims().len() != c_axes.len()
+    {
         return Err(CircuitError::UnsupportedOp);
     }
 
@@ -1018,8 +1087,20 @@ fn layout_probabilistic_freivalds_matmul<F: PrimeField + TensorType + PartialOrd
         .copied()
         .map(dim)
         .try_fold(1usize, |acc, v| v.map(|vv| acc * vv))?;
-    let n = contract_axes.iter().copied().map(dim).try_fold(1usize, |acc, v| Ok::<usize, crate::circuit::CircuitError>(acc * v?))?;
-    let p = right_axes.iter().copied().map(dim).try_fold(1usize, |acc, v| Ok::<usize, crate::circuit::CircuitError>(acc * v?))?;
+    let n = contract_axes
+        .iter()
+        .copied()
+        .map(dim)
+        .try_fold(1usize, |acc, v| {
+            Ok::<usize, crate::circuit::CircuitError>(acc * v?)
+        })?;
+    let p = right_axes
+        .iter()
+        .copied()
+        .map(dim)
+        .try_fold(1usize, |acc, v| {
+            Ok::<usize, crate::circuit::CircuitError>(acc * v?)
+        })?;
 
     // Batch cartesian product
     let mut batch_indices = batch_axes
@@ -1041,25 +1122,55 @@ fn layout_probabilistic_freivalds_matmul<F: PrimeField + TensorType + PartialOrd
         let b_slice = slice_by_batch(b, &b_axes, &batch_axes, batch_idx, axes_to_dim)?;
         let c_slice = slice_by_batch(c, &c_axes, &batch_axes, batch_idx, axes_to_dim)?;
 
-        let a_axes_nb = a_axes.iter().copied().filter(|ch| !batch_set.contains(ch)).collect_vec();
-        let b_axes_nb = b_axes.iter().copied().filter(|ch| !batch_set.contains(ch)).collect_vec();
-        let c_axes_nb = c_axes.iter().copied().filter(|ch| !batch_set.contains(ch)).collect_vec();
+        let a_axes_nb = a_axes
+            .iter()
+            .copied()
+            .filter(|ch| !batch_set.contains(ch))
+            .collect_vec();
+        let b_axes_nb = b_axes
+            .iter()
+            .copied()
+            .filter(|ch| !batch_set.contains(ch))
+            .collect_vec();
+        let c_axes_nb = c_axes
+            .iter()
+            .copied()
+            .filter(|ch| !batch_set.contains(ch))
+            .collect_vec();
 
-        let a_desired = left_axes.iter().copied().chain(contract_axes.iter().copied()).collect_vec();
-        let b_desired = contract_axes.iter().copied().chain(right_axes.iter().copied()).collect_vec();
-        let c_desired = left_axes.iter().copied().chain(right_axes.iter().copied()).collect_vec();
+        let a_desired = left_axes
+            .iter()
+            .copied()
+            .chain(contract_axes.iter().copied())
+            .collect_vec();
+        let b_desired = contract_axes
+            .iter()
+            .copied()
+            .chain(right_axes.iter().copied())
+            .collect_vec();
+        let c_desired = left_axes
+            .iter()
+            .copied()
+            .chain(right_axes.iter().copied())
+            .collect_vec();
 
         let mut a_mat = reorder_axes(&a_slice, &a_axes_nb, &a_desired, axes_to_dim)?;
         a_mat.flatten();
-        a_mat.reshape(&[m, n]).map_err(|_| CircuitError::ConstrainError)?;
+        a_mat
+            .reshape(&[m, n])
+            .map_err(|_| CircuitError::ConstrainError)?;
 
         let mut b_mat = reorder_axes(&b_slice, &b_axes_nb, &b_desired, axes_to_dim)?;
         b_mat.flatten();
-        b_mat.reshape(&[n, p]).map_err(|_| CircuitError::ConstrainError)?;
+        b_mat
+            .reshape(&[n, p])
+            .map_err(|_| CircuitError::ConstrainError)?;
 
         let mut c_mat = reorder_axes(&c_slice, &c_axes_nb, &c_desired, axes_to_dim)?;
         c_mat.flatten();
-        c_mat.reshape(&[m, p]).map_err(|_| CircuitError::ConstrainError)?;
+        c_mat
+            .reshape(&[m, p])
+            .map_err(|_| CircuitError::ConstrainError)?;
 
         let domain_base = (batch_flat as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64);
 
@@ -1086,7 +1197,10 @@ fn slice_by_batch<F: PrimeField + TensorType + PartialOrd + std::hash::Hash>(
 
     let mut ranges: Vec<Range<usize>> = Vec::with_capacity(t_axes.len());
     for ch in t_axes.iter().copied() {
-        let d = axes_to_dim.get(&ch).copied().ok_or(CircuitError::UnsupportedOp)?;
+        let d = axes_to_dim
+            .get(&ch)
+            .copied()
+            .ok_or(CircuitError::UnsupportedOp)?;
         if let Some(pos) = batch_axes.iter().position(|b| *b == ch) {
             let i = batch_idx[pos];
             ranges.push(i..i + 1);
@@ -1095,7 +1209,9 @@ fn slice_by_batch<F: PrimeField + TensorType + PartialOrd + std::hash::Hash>(
         }
     }
 
-    let mut sliced = t.get_slice(&ranges).map_err(|_| CircuitError::ConstrainError)?;
+    let mut sliced = t
+        .get_slice(&ranges)
+        .map_err(|_| CircuitError::ConstrainError)?;
     sliced
         .remove_trivial_axes()
         .map_err(|_| CircuitError::ConstrainError)?;
@@ -1135,10 +1251,17 @@ fn reorder_axes<F: PrimeField + TensorType + PartialOrd + std::hash::Hash>(
     let desired_dims = desired_axes
         .iter()
         .copied()
-        .map(|ch| axes_to_dim.get(&ch).copied().ok_or(CircuitError::UnsupportedOp))
+        .map(|ch| {
+            axes_to_dim
+                .get(&ch)
+                .copied()
+                .ok_or(CircuitError::UnsupportedOp)
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let inner = t.get_inner_tensor().map_err(|_| CircuitError::ConstrainError)?;
+    let inner = t
+        .get_inner_tensor()
+        .map_err(|_| CircuitError::ConstrainError)?;
 
     let mut desired_indices = desired_dims
         .iter()
@@ -1153,7 +1276,9 @@ fn reorder_axes<F: PrimeField + TensorType + PartialOrd + std::hash::Hash>(
     for idxs_desired in desired_indices.into_iter() {
         let mut idxs_current = vec![0usize; current_axes.len()];
         for (k, axis) in desired_axes.iter().copied().enumerate() {
-            let pos = *pos_in_current.get(&axis).ok_or(CircuitError::UnsupportedOp)?;
+            let pos = *pos_in_current
+                .get(&axis)
+                .ok_or(CircuitError::UnsupportedOp)?;
             idxs_current[pos] = idxs_desired[k];
         }
 
@@ -1162,7 +1287,8 @@ fn reorder_axes<F: PrimeField + TensorType + PartialOrd + std::hash::Hash>(
     }
 
     let mut out: ValTensor<F> = out_vals.into();
-    out.reshape(&desired_dims).map_err(|_| CircuitError::ConstrainError)?;
+    out.reshape(&desired_dims)
+        .map_err(|_| CircuitError::ConstrainError)?;
     Ok(out)
 }
 

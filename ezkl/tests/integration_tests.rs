@@ -351,6 +351,28 @@ mod native_tests {
                 test_dir.close().unwrap();
             }
 
+            #[test]
+            fn mock_no_public_instances_() {
+                let test = "1l_relu";
+                crate::native_tests::init_binary();
+                let test_dir = TempDir::new(test).unwrap();
+                let path = test_dir.path().to_str().unwrap();
+                crate::native_tests::mv_test_(path, test);
+                mock(path, test.to_string(), "private", "fixed", "private", 1, "resources", None, false, None, None);
+                test_dir.close().unwrap();
+            }
+
+            #[test]
+            fn kzg_prove_and_verify_no_public_instances_() {
+                let test = "1l_relu";
+                crate::native_tests::init_binary();
+                let test_dir = TempDir::new(test).unwrap();
+                let path = test_dir.path().to_str().unwrap();
+                crate::native_tests::mv_test_(path, test);
+                prove_and_verify(path, test.to_string(), "safe", "private", "fixed", "private", 1, None, false, 2);
+                test_dir.close().unwrap();
+            }
+
             seq!(N in 0..=5 {
             #(#[test_case(ACCURACY_CAL_TESTS[N])])*
             fn mock_accuracy_cal_tests(test: &str) {

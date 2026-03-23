@@ -28,9 +28,9 @@ pub mod witness;
 /// GraphCircuit (compiled circuit) wrapper around Model + GraphSettings.
 pub mod circuit;
 
+pub use circuit::*;
 pub use config::*;
 pub use witness::*;
-pub use circuit::*;
 
 pub use input::DataSource;
 pub use model::*;

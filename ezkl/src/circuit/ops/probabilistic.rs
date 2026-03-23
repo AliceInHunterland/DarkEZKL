@@ -446,4 +446,3 @@ mod tests {
         assert_ne!(c, Fr::zero());
     }
 }
-

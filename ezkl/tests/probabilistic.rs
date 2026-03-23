@@ -24,7 +24,9 @@ fn ezkl_bin() -> String {
 }
 
 fn run_cmd(mut cmd: Command, what: &str) {
-    let status = cmd.status().unwrap_or_else(|e| panic!("failed to run {what}: {e}"));
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run {what}: {e}"));
     assert!(status.success(), "{what} failed with status: {status}");
 }
 
@@ -58,7 +60,10 @@ fn init_binary() {
             args.push(features.join(","));
         }
 
-        run_cmd(Command::new("cargo").args(&args), "cargo build ezkl (test-runs profile)");
+        run_cmd(
+            Command::new("cargo").args(&args),
+            "cargo build ezkl (test-runs profile)",
+        );
     });
 }
 
@@ -143,8 +148,8 @@ json.dump({"input_data": [x]}, open("input.json", "w"))
 }
 
 fn init_params(settings_path: &Path) -> u32 {
-    let settings_str =
-        fs::read_to_string(settings_path).unwrap_or_else(|_| panic!("failed to read {settings_path:?}"));
+    let settings_str = fs::read_to_string(settings_path)
+        .unwrap_or_else(|_| panic!("failed to read {settings_path:?}"));
     let settings: GraphSettings =
         serde_json::from_str(&settings_str).expect("failed to parse settings.json");
     let logrows = settings.run_args.logrows;

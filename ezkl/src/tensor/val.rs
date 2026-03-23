@@ -836,7 +836,6 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> ValTensor<F> {
         Ok(slice)
     }
 
-
     /// Gets the inner values as a tensor of Value<F>
     pub fn get_inner(&self) -> Result<Tensor<Value<F>>, TensorError> {
         Ok(match self {

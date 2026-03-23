@@ -327,9 +327,12 @@ impl FreivaldsCheck {
                     unravel_index(b_idx, &spec.batch_dims)?
                 };
 
-                let a_mat = slice_batch_to_matrix(&a_perm, batch_rank, &batch_multi, spec.m, spec.n)?;
-                let b_mat = slice_batch_to_matrix(&b_perm, batch_rank, &batch_multi, spec.n, spec.p)?;
-                let c_mat = slice_batch_to_matrix(&c_perm, batch_rank, &batch_multi, spec.m, spec.p)?;
+                let a_mat =
+                    slice_batch_to_matrix(&a_perm, batch_rank, &batch_multi, spec.m, spec.n)?;
+                let b_mat =
+                    slice_batch_to_matrix(&b_perm, batch_rank, &batch_multi, spec.n, spec.p)?;
+                let c_mat =
+                    slice_batch_to_matrix(&c_perm, batch_rank, &batch_multi, spec.m, spec.p)?;
 
                 // Domain separation so each repetition / batch uses a distinct r.
                 let domain_sep = (rep as u64)
@@ -402,7 +405,9 @@ fn permute_valtensor<F: PrimeField + TensorType + PartialOrd + std::hash::Hash>(
     let new_dims: Vec<usize> = desired_positions.iter().map(|&i| curr_dims[i]).collect();
 
     // Read old values in row-major order.
-    let inner = t.get_inner_tensor().map_err(|_| CircuitError::ConstrainError)?;
+    let inner = t
+        .get_inner_tensor()
+        .map_err(|_| CircuitError::ConstrainError)?;
     let old_vals: Vec<ValType<F>> = inner.iter().cloned().collect();
 
     // Compute strides.
@@ -426,8 +431,8 @@ fn permute_valtensor<F: PrimeField + TensorType + PartialOrd + std::hash::Hash>(
         new_vals.push(old_vals[old_lin].clone());
     }
 
-    let new_tensor =
-        Tensor::<ValType<F>>::new(Some(&new_vals), &new_dims).map_err(|_| CircuitError::ConstrainError)?;
+    let new_tensor = Tensor::<ValType<F>>::new(Some(&new_vals), &new_dims)
+        .map_err(|_| CircuitError::ConstrainError)?;
     Ok(ValTensor::from(new_tensor))
 }
 
@@ -467,18 +472,22 @@ fn slice_batch_to_matrix<F: PrimeField + TensorType + PartialOrd + std::hash::Ha
         }
     }
 
-    let mut sliced = t.get_slice(&ranges).map_err(|_| CircuitError::ConstrainError)?;
+    let mut sliced = t
+        .get_slice(&ranges)
+        .map_err(|_| CircuitError::ConstrainError)?;
     sliced.flatten();
 
-    let inner = sliced.get_inner_tensor().map_err(|_| CircuitError::ConstrainError)?;
+    let inner = sliced
+        .get_inner_tensor()
+        .map_err(|_| CircuitError::ConstrainError)?;
     let vals: Vec<ValType<F>> = inner.iter().cloned().collect();
 
     if vals.len() != rows * cols {
         return Err(CircuitError::ConstrainError);
     }
 
-    let mat_tensor =
-        Tensor::<ValType<F>>::new(Some(&vals), &[rows, cols]).map_err(|_| CircuitError::ConstrainError)?;
+    let mat_tensor = Tensor::<ValType<F>>::new(Some(&vals), &[rows, cols])
+        .map_err(|_| CircuitError::ConstrainError)?;
     Ok(ValTensor::from(mat_tensor))
 }
 
@@ -516,5 +525,8 @@ fn dot_usize(a: &[usize], b: &[usize]) -> Result<usize, CircuitError> {
     if a.len() != b.len() {
         return Err(CircuitError::ConstrainError);
     }
-    Ok(a.iter().zip(b.iter()).map(|(x, y)| x.saturating_mul(*y)).sum())
+    Ok(a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| x.saturating_mul(*y))
+        .sum())
 }

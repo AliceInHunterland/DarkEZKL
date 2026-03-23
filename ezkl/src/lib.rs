@@ -123,8 +123,6 @@ impl fmt::Display for EZKLError {
     }
 }
 
-
-
 #[cfg(feature = "ezkl")]
 impl<E> From<E> for EZKLError
 where
@@ -203,7 +201,9 @@ pub enum CalibrationTarget {
 #[cfg(feature = "ezkl")]
 impl Default for CalibrationTarget {
     fn default() -> Self {
-        CalibrationTarget::Resources { col_overflow: false }
+        CalibrationTarget::Resources {
+            col_overflow: false,
+        }
     }
 }
 
@@ -211,8 +211,12 @@ impl Default for CalibrationTarget {
 impl fmt::Display for CalibrationTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CalibrationTarget::Resources { col_overflow: false } => write!(f, "resources"),
-            CalibrationTarget::Resources { col_overflow: true } => write!(f, "resources_col_overflow"),
+            CalibrationTarget::Resources {
+                col_overflow: false,
+            } => write!(f, "resources"),
+            CalibrationTarget::Resources { col_overflow: true } => {
+                write!(f, "resources_col_overflow")
+            }
             CalibrationTarget::Accuracy => write!(f, "accuracy"),
         }
     }
@@ -272,9 +276,8 @@ impl FromStr for ContractType {
         let v = s.trim().to_lowercase();
         match v.as_str() {
             "verifier" => Ok(ContractType::Verifier { reusable: false }),
-            "verifier_reusable" | "verifier-reusable" | "reusable_verifier" | "reusable-verifier" => {
-                Ok(ContractType::Verifier { reusable: true })
-            }
+            "verifier_reusable" | "verifier-reusable" | "reusable_verifier"
+            | "reusable-verifier" => Ok(ContractType::Verifier { reusable: true }),
             _ => Err(format!(
                 "invalid contract type '{}'; expected 'verifier' or 'verifier_reusable'",
                 s

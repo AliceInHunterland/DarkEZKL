@@ -260,22 +260,36 @@ def _resolve_case_spec_defaults(model_name: str, cache_dir: Path) -> Dict[str, O
     try:
         from ezkl_bench.models import get_model_specs
     except Exception:
-        return {"display_name": model_name, "input_scale": None, "param_scale": None, "num_inner_cols": None}
+        return {
+            "display_name": model_name,
+            "input_scale": None,
+            "param_scale": None,
+            "num_inner_cols": None,
+            "input_side": None,
+        }
 
     specs = get_model_specs(cache_dir)
     spec = specs.get(model_name)
     if spec is None:
-        return {"display_name": model_name, "input_scale": None, "param_scale": None, "num_inner_cols": None}
+        return {
+            "display_name": model_name,
+            "input_scale": None,
+            "param_scale": None,
+            "num_inner_cols": None,
+            "input_side": None,
+        }
 
     suffix = _model_env_suffix(spec.key)
     input_scale = _read_positive_int_env([f"EZKL_BENCH_INPUT_SCALE_{suffix}", "EZKL_BENCH_INPUT_SCALE"])
     param_scale = _read_positive_int_env([f"EZKL_BENCH_PARAM_SCALE_{suffix}", "EZKL_BENCH_PARAM_SCALE"])
     num_inner_cols = _read_positive_int_env([f"EZKL_BENCH_NUM_INNER_COLS_{suffix}", "EZKL_BENCH_NUM_INNER_COLS"])
+    input_side = _read_positive_int_env([f"EZKL_BENCH_INPUT_SIDE_{suffix}", "EZKL_BENCH_INPUT_SIDE"])
     return {
         "display_name": spec.display_name,
         "input_scale": int(input_scale) if input_scale is not None else int(spec.input_scale),
         "param_scale": int(param_scale) if param_scale is not None else int(spec.param_scale),
         "num_inner_cols": int(num_inner_cols) if num_inner_cols is not None else int(spec.num_inner_cols),
+        "input_side": int(input_side) if input_side is not None else spec.input_side,
     }
 
 
@@ -393,6 +407,7 @@ def _adapt_model_result_to_legacy_metrics(
         "input_scale": spec_defaults.get("input_scale"),
         "param_scale": spec_defaults.get("param_scale"),
         "num_inner_cols": spec_defaults.get("num_inner_cols"),
+        "input_side": spec_defaults.get("input_side"),
         "logrows": payload.get("logrows"),
         "constraint_count": _segment_int_sum(diagnostics, "total_assignments"),
         "timings_s": timings,
@@ -989,6 +1004,10 @@ def main() -> int:
     cache_dir = Path(args.cache_dir) if str(args.cache_dir).strip() else None
     prob_ops = _parse_csv_list(args.prob_ops) or ["MatMul", "Gemm", "Conv"]
     prob_seed_mode = str(args.prob_seed_mode).strip() or "fiat_shamir"
+    split_enabled = _split_enabled_from_env()
+    auto_skip_mock = bool(split_enabled) and (DEFAULT_EXECUTION_MODE == "probabilistic")
+    requested_skip_mock = bool(args.skip_mock)
+    effective_skip_mock = requested_skip_mock or auto_skip_mock
 
     env_report = _gather_env_report()
 
@@ -1009,9 +1028,12 @@ def main() -> int:
         "runs_per_case": runs,
         "prob_ops": prob_ops,
         "prob_seed_mode": prob_seed_mode,
+        "split_onnx": bool(split_enabled),
         "isolate_models": isolate,
         "skip_verify": bool(args.skip_verify),
-        "skip_mock": bool(args.skip_mock),
+        "skip_mock": bool(effective_skip_mock),
+        "skip_mock_requested": bool(requested_skip_mock),
+        "skip_mock_forced_split_probabilistic": bool(auto_skip_mock and not requested_skip_mock),
     }
 
     cases: List[Dict[str, Any]] = []
@@ -1027,6 +1049,10 @@ def main() -> int:
     print(f"  Runs per case: {runs}")
     print(f"  Total cases: {total_cases}")
     print(f"  Isolation: {isolate}")
+    print(f"  split_onnx: {split_enabled}")
+    print(f"  skip_mock(requested/effective): {requested_skip_mock}/{effective_skip_mock}")
+    if auto_skip_mock and not requested_skip_mock:
+        print("  NOTE: forcing --skip-mock for split+probabilistic run to avoid mock(seg_000) blocker")
     print(f"{'='*80}\n")
 
     for model_name in models:
@@ -1050,7 +1076,7 @@ def main() -> int:
                         prob_ops=prob_ops,
                         prob_seed_mode=prob_seed_mode,
                         skip_verify=bool(args.skip_verify),
-                        skip_mock=bool(args.skip_mock),
+                        skip_mock=bool(effective_skip_mock),
                         timeout_s=int(args.timeout_s),
                         tail_lines=tail_lines,
                     )
@@ -1064,7 +1090,7 @@ def main() -> int:
                         prob_ops=prob_ops,
                         prob_seed_mode=prob_seed_mode,
                         skip_verify=bool(args.skip_verify),
-                        skip_mock=bool(args.skip_mock),
+                        skip_mock=bool(effective_skip_mock),
                     )
 
                 cases.append(case)

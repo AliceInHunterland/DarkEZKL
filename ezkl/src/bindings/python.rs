@@ -130,10 +130,8 @@ fn update_settings_file(
                 .map(|s| s.to_string())
         });
 
-    let existing_ops: Option<Vec<String>> = root
-        .get("prob_ops")
-        .and_then(parse_ops_value)
-        .or_else(|| {
+    let existing_ops: Option<Vec<String>> =
+        root.get("prob_ops").and_then(parse_ops_value).or_else(|| {
             root.get("run_args")
                 .and_then(|ra| ra.get("prob_ops"))
                 .and_then(parse_ops_value)
@@ -381,7 +379,10 @@ mod pyo3_bindings {
     /// - logrows: u32 (optional; overrides settings_path if provided)
     #[pyfunction]
     #[pyo3(signature = (*args, **kwargs))]
-    pub fn get_srs(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<bool> {
+    pub fn get_srs(
+        args: &Bound<'_, PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<bool> {
         let settings_path = get_kwarg_string(kwargs, "settings_path")?
             .or_else(|| maybe_positional_string(args, 0).ok().flatten())
             .map(PathBuf::from);

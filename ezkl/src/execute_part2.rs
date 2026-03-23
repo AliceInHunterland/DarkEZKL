@@ -790,13 +790,15 @@ pub(crate) fn mock(
     circuit.load_graph_witness(&data)?;
 
     let public_inputs = circuit.prepare_public_inputs(&data)?;
+    let circuit_settings = circuit.settings().clone();
+    let public_input_columns = proof_instances(&circuit_settings, public_inputs);
 
     log::info!("Mock proof");
 
     let prover = halo2_proofs::dev::MockProver::run(
         circuit.settings().run_args.logrows,
         &circuit,
-        vec![public_inputs],
+        public_input_columns,
     )
         .map_err(|e| ExecutionError::MockProverError(e.to_string()))?;
 
@@ -862,6 +864,7 @@ pub(crate) fn prove(
     let public_inputs = circuit.prepare_public_inputs(&data)?;
 
     let circuit_settings = circuit.settings().clone();
+    let public_input_columns = proof_instances(&circuit_settings, public_inputs);
 
     let proof_split_commits: Option<ProofSplitCommit> = data.into();
 
@@ -886,7 +889,7 @@ pub(crate) fn prove(
         TR,
     >(
         circuit,
-        vec![public_inputs],
+        public_input_columns,
         &params,
         &pk,
         check_mode,
@@ -901,6 +904,18 @@ pub(crate) fn prove(
     }
 
     Ok(snark)
+}
+
+fn proof_instances(
+    circuit_settings: &GraphSettings,
+    public_inputs: Vec<Fr>,
+) -> Vec<Vec<Fr>> {
+    // Halo2 expects zero instance columns for fully private/fixed circuits.
+    if circuit_settings.total_instances().iter().sum::<usize>() == 0 {
+        vec![]
+    } else {
+        vec![public_inputs]
+    }
 }
 
 pub(crate) fn swap_proof_commitments_cmd(

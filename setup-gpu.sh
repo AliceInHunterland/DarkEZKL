@@ -56,6 +56,41 @@ prepare_dirs() {
   mkdir -p "$RESULTS_DIR" "$CACHE_DIR" "$EZKL_CACHE_DIR/srs"
 }
 
+build_passthrough_env_args() {
+  PASSTHROUGH_ENV_ARGS=()
+
+  local name
+  declare -A seen=()
+
+  local -a exact_names=(
+    HF_HUB_OFFLINE
+    EZKL_EXECUTION_MODE
+    EZKL_PROB_K
+    EZKL_PROB_OPS
+    EZKL_PROB_SEED_MODE
+  )
+
+  for name in "${exact_names[@]}"; do
+    if [[ -n "${!name+x}" ]]; then
+      PASSTHROUGH_ENV_ARGS+=(-e "$name")
+      seen["$name"]=1
+    fi
+  done
+
+  while IFS='=' read -r name _; do
+    [[ -n "$name" ]] || continue
+    if [[ -n "${seen[$name]+x}" ]]; then
+      continue
+    fi
+    case "$name" in
+      EZKL_BENCH_*|EZKL_PROB_*)
+        PASSTHROUGH_ENV_ARGS+=(-e "$name")
+        seen["$name"]=1
+        ;;
+    esac
+  done < <(env)
+}
+
 warn_if_missing_large_srs() {
   if [[ ! -f "$EZKL_CACHE_DIR/srs/kzg26.srs" ]]; then
     cat >&2 <<EOF
@@ -100,6 +135,7 @@ build_image() {
 run_benchmark_container() {
   prepare_dirs
   warn_if_missing_large_srs
+  build_passthrough_env_args
 
   docker run --rm --gpus all \
     --shm-size "$SHM_SIZE" \
@@ -126,6 +162,7 @@ run_benchmark_container() {
     -e MODEL_PROCESS_TAIL_LINES="${MODEL_PROCESS_TAIL_LINES:-250}" \
     -e SPLIT_ONNX="${SPLIT_ONNX:-true}" \
     -e SPLIT_MIN_PARAMS_M="${SPLIT_MIN_PARAMS_M:-0.05}" \
+    "${PASSTHROUGH_ENV_ARGS[@]}" \
     -v "$RESULTS_DIR:/app/results" \
     -v "$CACHE_DIR:/app/.cache" \
     -v "$EZKL_CACHE_DIR:/root/.ezkl" \

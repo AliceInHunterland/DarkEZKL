@@ -195,7 +195,10 @@ use halo2curves::bn256::G1Affine;
 
 #[cfg(feature = "python-bindings")]
 ///
-pub fn g1affine_to_pydict(g1affine_dict: &pyo3::Bound<'_, pyo3::types::PyDict>, g1affine: &G1Affine) {
+pub fn g1affine_to_pydict(
+    g1affine_dict: &pyo3::Bound<'_, pyo3::types::PyDict>,
+    g1affine: &G1Affine,
+) {
     let g1affine_x = field_to_string(&g1affine.x);
     let g1affine_y = field_to_string(&g1affine.y);
     g1affine_dict.set_item("x", g1affine_x).unwrap();
