@@ -274,7 +274,7 @@ def _describe_segment_bounds(
     }
 
 
-def _coalesce_zero_input_segments(
+def _coalesce_invalid_segments(
     *,
     bounds: List[Tuple[int, int]],
     nodes: Sequence[onnx.NodeProto],
@@ -287,10 +287,10 @@ def _coalesce_zero_input_segments(
     graph_input_names: Sequence[str],
 ) -> List[Tuple[int, int]]:
     """
-    Avoid standalone internal segments that have no external inputs.
+    Avoid standalone internal segments that have no external inputs or no live outputs.
 
-    Those segments are typically constant-only subgraphs created by the splitter.
-    They add benchmark overhead and can break downstream EZKL input handling.
+    These usually come from constant-only subgraphs or dead nodes left after ONNX
+    rewrites. They add benchmark overhead and can break downstream EZKL extraction.
     """
     merged = list(bounds)
     while len(merged) > 1:
@@ -308,17 +308,21 @@ def _coalesce_zero_input_segments(
                 graph_output_names=graph_output_names,
                 graph_input_names=graph_input_names,
             )
-            if desc["input_names"]:
+            has_inputs = bool(desc["input_names"])
+            has_outputs = bool(desc["output_names"])
+            if has_inputs and has_outputs:
                 continue
 
-            # Prefer merging forward so constant-only prefixes stay close to the
-            # first data-dependent segment that consumes them. If this is the
+            issue = "zero-input" if not has_inputs else "zero-output"
+            # Prefer merging forward so invalid internal fragments stay close to the
+            # first live segment that consumes or produces real data. If this is the
             # final segment, merge backward instead.
             if idx < len(merged) - 1:
                 start = merged[idx][0]
                 end = merged[idx + 1][1]
                 logger.info(
-                    "Coalescing zero-input segment %s into following segment (%s..%s -> %s..%s)",
+                    "Coalescing %s segment %s into following segment (%s..%s -> %s..%s)",
+                    issue,
                     idx,
                     merged[idx][0],
                     merged[idx][1],
@@ -331,7 +335,8 @@ def _coalesce_zero_input_segments(
                 start = merged[idx - 1][0]
                 end = merged[idx][1]
                 logger.info(
-                    "Coalescing trailing zero-input segment %s into previous segment (%s..%s -> %s..%s)",
+                    "Coalescing trailing %s segment %s into previous segment (%s..%s -> %s..%s)",
+                    issue,
                     idx,
                     merged[idx][0],
                     merged[idx][1],
@@ -451,7 +456,7 @@ def split_onnx_model(
                 acc = 0
                 seg_nodes = 0
         segments.append((seg_start, len(nodes) - 1))
-        segments = _coalesce_zero_input_segments(
+        segments = _coalesce_invalid_segments(
             bounds=segments,
             nodes=nodes,
             node_params=node_params,

@@ -341,8 +341,10 @@ pub(crate) fn calibrate(
                 v.clear();
             }
 
-            let mut attempt_circuit = match GraphCircuit::from_run_args(&local_run_args, &model_path)
-            {
+            let mut attempt_circuit = match GraphCircuit::from_run_args(
+                &local_run_args,
+                &model_path,
+            ) {
                 Ok(c) => c,
                 Err(e) => {
                     let msg = format!("circuit creation from run args failed: {}", e);
@@ -518,12 +520,16 @@ pub(crate) fn calibrate(
                 Err(crate::graph::errors::GraphError::ExtendedKTooLarge(required_k)) => {
                     // Stop if we're already at (or above) our widening cap.
                     if local_run_args.num_inner_cols >= auto_num_inner_cols_max {
-                        break Err(crate::graph::errors::GraphError::ExtendedKTooLarge(required_k));
+                        break Err(crate::graph::errors::GraphError::ExtendedKTooLarge(
+                            required_k,
+                        ));
                     }
 
                     // If required_k is not improving across retries, stop to avoid infinite loops.
                     if last_required_k == Some(required_k) {
-                        break Err(crate::graph::errors::GraphError::ExtendedKTooLarge(required_k));
+                        break Err(crate::graph::errors::GraphError::ExtendedKTooLarge(
+                            required_k,
+                        ));
                     }
                     last_required_k = Some(required_k);
 
@@ -691,7 +697,9 @@ pub(crate) fn calibrate(
                 )
             });
 
-            let last = param_iterator.next_back().ok_or_else(|| EZKLError::msg("no params found"))?;
+            let last = param_iterator
+                .next_back()
+                .ok_or_else(|| EZKLError::msg("no params found"))?;
             let max_scale = (
                 last.run_args.input_scale,
                 last.run_args.param_scale,
@@ -800,7 +808,7 @@ pub(crate) fn mock(
         &circuit,
         public_input_columns,
     )
-        .map_err(|e| ExecutionError::MockProverError(e.to_string()))?;
+    .map_err(|e| ExecutionError::MockProverError(e.to_string()))?;
 
     prover.verify().map_err(ExecutionError::VerifyError)?;
     Ok(String::new())
@@ -819,6 +827,15 @@ pub(crate) fn compile_circuit(
     }
 
     let circuit = GraphCircuit::from_settings(&settings, &model_path, settings.check_mode)?;
+
+    if circuit.settings() != &settings {
+        log::info!(
+            "saving normalized circuit settings back to {} so downstream setup/prove/verify use a consistent execution contract",
+            settings_path.display()
+        );
+        circuit.settings().save(&settings_path)?;
+    }
+
     circuit.save(compiled_circuit)?;
     Ok(String::new())
 }
@@ -912,10 +929,7 @@ pub(crate) fn prove(
     Ok(snark)
 }
 
-fn proof_instances(
-    circuit_settings: &GraphSettings,
-    public_inputs: Vec<Fr>,
-) -> Vec<Vec<Fr>> {
+fn proof_instances(circuit_settings: &GraphSettings, public_inputs: Vec<Fr>) -> Vec<Vec<Fr>> {
     // Halo2 expects zero instance columns for fully private/fixed circuits.
     if circuit_settings.total_instances().iter().sum::<usize>() == 0 {
         vec![]
@@ -935,7 +949,8 @@ pub(crate) fn swap_proof_commitments_cmd(
     type E = Challenge255<G1Affine>;
     type TW = Blake2bWrite<Vec<u8>, G1Affine, E>;
 
-    let snark_new = swap_proof_commitments::<KZGCommitmentScheme<Bn256>, E, TW>(&snark, &commitments)?;
+    let snark_new =
+        swap_proof_commitments::<KZGCommitmentScheme<Bn256>, E, TW>(&snark, &commitments)?;
 
     if snark_new.proof != *snark.proof {
         log::warn!("swap proof has created a different proof");
@@ -994,10 +1009,10 @@ fn verify_commitment<
 ) -> Result<bool, EZKLError>
 where
     Scheme::Scalar: FromUniformBytes<64>
-    + SerdeObject
-    + Serialize
-    + DeserializeOwned
-    + WithSmallOrderMulGroup<3>,
+        + SerdeObject
+        + Serialize
+        + DeserializeOwned
+        + WithSmallOrderMulGroup<3>,
     Scheme::Curve: SerdeObject + Serialize + DeserializeOwned,
     Scheme::ParamsVerifier: 'a,
 {
@@ -1011,7 +1026,11 @@ where
         verify_proof_circuit::<V, _, _, _, TR>(&proof, params, &vk, strategy, 1 << logrows);
 
     let elapsed = now.elapsed();
-    log::info!("verify took {}.{}", elapsed.as_secs(), elapsed.subsec_millis());
+    log::info!(
+        "verify took {}.{}",
+        elapsed.as_secs(),
+        elapsed.subsec_millis()
+    );
     log::info!("verified: {}", result.is_ok());
     result
         .map_err(|e: halo2_proofs::plonk::Error| e.into())

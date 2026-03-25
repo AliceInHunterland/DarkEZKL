@@ -186,9 +186,10 @@ def _parse_csv_ints(s: str) -> List[int]:
 def _default_prob_ops_for_model(model_name: str) -> List[str]:
     key = (model_name or "").strip().lower()
     if key in {"repvgg", "repvgg-a0", "repvgg_a0"}:
-        # RepVGG currently proves reliably with probabilistic matmul/gemm, but
-        # the first conv-heavy split segment still hits a halo2 synthesis error.
-        return ["MatMul", "Gemm"]
+        # Keep Conv enabled for RepVGG model-default runs. Excluding Conv forces
+        # the early split branches back to exact execution, which can oversize
+        # the first 3x3 Conv segment beyond the model's split caps.
+        return list(DEFAULT_PROB_OPS)
     return list(DEFAULT_PROB_OPS)
 
 
@@ -1069,7 +1070,7 @@ def main() -> int:
     if requested_prob_ops:
         print(f"  prob_ops: {requested_prob_ops} (explicit)")
     else:
-        print("  prob_ops: model defaults (repvgg-a0 -> MatMul,Gemm; others -> MatMul,Gemm,Conv)")
+        print("  prob_ops: model defaults (all built-ins -> MatMul,Gemm,Conv)")
     print(f"  skip_mock(requested/effective): {requested_skip_mock}/{effective_skip_mock}")
     if auto_skip_mock and not requested_skip_mock:
         print("  NOTE: forcing --skip-mock for split+probabilistic run to avoid mock(seg_000) blocker")

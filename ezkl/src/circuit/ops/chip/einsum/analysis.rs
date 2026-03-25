@@ -232,7 +232,9 @@ fn analyze_single_equation_inner(
             && non_common_indices.len() > 1)
     };
 
-    let mut strategy = if dispatch_to_einsum_with_base_ops {
+    let matmul_candidate_for_freivalds = is_matmul_candidate_for_freivalds(&equation);
+
+    let mut strategy = if dispatch_to_einsum_with_base_ops || !matmul_candidate_for_freivalds {
         EinsumStrategy::BaseOps
     } else {
         EinsumStrategy::Freivalds
@@ -243,7 +245,7 @@ fn analyze_single_equation_inner(
         if settings.execution_mode == ExecutionMode::Probabilistic
             && settings.prob_k > 0
             && (prob_ops_contains(settings, "MatMul") || prob_ops_contains(settings, "Gemm"))
-            && is_matmul_candidate_for_freivalds(&equation)
+            && matmul_candidate_for_freivalds
         {
             strategy = EinsumStrategy::Freivalds;
         }
@@ -272,7 +274,7 @@ fn prob_ops_contains(settings: &RegionSettings, op_name: &str) -> bool {
 ///
 /// This intentionally mirrors the *structural* checks used by the Freivalds wrapper in `freivalds.rs`,
 /// but without needing actual tensors (we only have the equation here).
-fn is_matmul_candidate_for_freivalds(equation: &str) -> bool {
+pub(crate) fn is_matmul_candidate_for_freivalds(equation: &str) -> bool {
     let eq = match MatMulEquation::parse(equation) {
         Some(eq) => eq,
         None => return false,
@@ -379,5 +381,21 @@ mod tests {
     #[test]
     fn rejects_pure_batched_inner_products() {
         assert!(!is_matmul_candidate_for_freivalds("abcde,abcde->abcd"));
+    }
+
+    #[test]
+    fn conv_like_projected_shapes_use_base_ops_strategy() {
+        use std::collections::HashMap;
+
+        let axes_to_dim = HashMap::from([
+            ('N', 1usize),
+            ('I', 3usize),
+            ('H', 8usize),
+            ('W', 8usize),
+            ('O', 16usize),
+        ]);
+
+        let analysis = super::analyze_single_equation("NIHW,OI->NOHW", &axes_to_dim).unwrap();
+        assert!(matches!(analysis.strategy, super::EinsumStrategy::BaseOps));
     }
 }

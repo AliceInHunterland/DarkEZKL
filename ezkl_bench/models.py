@@ -321,7 +321,13 @@ class ModelSpec:
     precision: Optional[str] = None
 
     # Post-export ONNX patching knobs
+    # - rewrite_batchnorm: folds inference BatchNorm into affine ops before splitting
     # - rewrite_gemm: fixes ezkl/tract failures on Gemm for certain exported graphs
+    # - rewrite_conv_max_macs: rewrites oversized Conv nodes into smaller
+    #   channel chunks before ONNX splitting so single-node Conv segments can
+    #   be resplit into workable pieces.
+    rewrite_batchnorm: bool = False
+    rewrite_conv_max_macs: Optional[int] = None
     rewrite_gemm: bool = False
 
 
@@ -333,6 +339,14 @@ def get_model_specs(cache_dir: Path) -> Dict[str, ModelSpec]:
     aliases matching the new benchmark naming ('lenet-5-small', 'repvgg-a0').
     """
     repvgg_input_side = _resolve_model_input_side("repvgg_a0", 96)
+    # RepVGG-A0's early split Conv branches are the tightest k=19 cases we have.
+    # They can calibrate at ~440k rows after EZKL widens num_inner_cols to 16, which
+    # translates to ~7.0M total assignments for the same circuit footprint.
+    repvgg_max_segment_rows = 500_000
+    repvgg_max_segment_assignments = 8_000_000
+    # Cap each rewritten Conv chunk around the segment sizes that already prove
+    # successfully, instead of leaving the first 3x3 branch as one huge node.
+    repvgg_rewrite_conv_max_macs = 2_500_000
 
     specs: Dict[str, ModelSpec] = {
         "lenet": ModelSpec(
@@ -388,13 +402,15 @@ def get_model_specs(cache_dir: Path) -> Dict[str, ModelSpec]:
             input_side=repvgg_input_side,
             num_inner_cols=8,
             enable_onnx_split=True,
-            split_min_params=10_000,
-            split_max_nodes=3,
-            split_retry_budget=2,
-            max_segment_logrows=23,
-            max_segment_rows=8_000_000,
-            max_segment_assignments=64_000_000,
-            precision=None,
+            split_min_params=5_000,
+            split_max_nodes=2,
+            split_retry_budget=5,
+            max_segment_logrows=19,
+            max_segment_rows=repvgg_max_segment_rows,
+            max_segment_assignments=repvgg_max_segment_assignments,
+            precision="fp16",
+            rewrite_batchnorm=True,
+            rewrite_conv_max_macs=repvgg_rewrite_conv_max_macs,
             rewrite_gemm=False,
         ),
     }
@@ -420,13 +436,15 @@ def get_model_specs(cache_dir: Path) -> Dict[str, ModelSpec]:
         input_side=repvgg_input_side,
         num_inner_cols=8,
         enable_onnx_split=True,
-        split_min_params=10_000,
-        split_max_nodes=3,
-        split_retry_budget=2,
-        max_segment_logrows=23,
-        max_segment_rows=8_000_000,
-        max_segment_assignments=64_000_000,
-        precision=None,
+        split_min_params=5_000,
+        split_max_nodes=2,
+        split_retry_budget=5,
+        max_segment_logrows=19,
+        max_segment_rows=repvgg_max_segment_rows,
+        max_segment_assignments=repvgg_max_segment_assignments,
+        precision="fp16",
+        rewrite_batchnorm=True,
+        rewrite_conv_max_macs=repvgg_rewrite_conv_max_macs,
         rewrite_gemm=False,
     )
 

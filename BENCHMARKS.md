@@ -58,10 +58,20 @@ Each successful run writes a `vit_bench_report.json` with:
 - `execution_mode`: Always `"probabilistic"` in this benchmark runner.
 - `prob_k`: Freivalds repetition count (soundness knob + cost knob).
 - `prob_ops`: Which ONNX ops are enabled for probabilistic verification (default: `MatMul,Gemm,Conv`).
+  - The suite's model-default runs now keep `Conv` enabled for `repvgg-a0` too.
+  - Excluding `Conv` there demotes the early split RepVGG branches back to exact execution,
+    which can push the first 3x3 Conv segment past the configured split caps.
 - `prob_seed_mode`: How the random challenge is derived (`fiat_shamir` by default).
 - `input_scale`, `param_scale`, `num_inner_cols`: Quantization + layout knobs used when generating settings.
 - `logrows`: The circuit size chosen during calibration (best-effort read from `settings.json`).
   - Circuit “capacity” is roughly proportional to `2^logrows`.
+  - For `repvgg-a0`, the split benchmark keeps a `k=19` cap but allows up to 500k calibrated rows
+    and 8.0M total assignments; the early Conv branches need that extra assignment headroom after
+    calibration widens `num_inner_cols` to stay within `k=19`.
+  - `repvgg-a0` also rewrites oversized Conv nodes into smaller channel chunks before ONNX
+    splitting, so single 3x3 Conv branches can be retried as multiple smaller segments.
+  - `repvgg-a0` also folds inference `BatchNormalization` identity branches into affine ops
+    before splitting, which avoids tract failures on standalone split BN segments.
 - `constraint_count`: Best-effort extraction from `settings.json` (may be `null` if not present).
 - `timings_s`: Map of measured durations (seconds) for key phases (see below).
 - `settings_path`, `compiled_path`, `witness_path`, `proof_path`, `work_dir`: Paths to artifacts for debugging / reproduction.

@@ -57,6 +57,52 @@ class CLICommandFailed(RuntimeError):
         )
 
 
+def _exception_text(exc: BaseException) -> str:
+    parts = [str(exc)]
+    tail = getattr(exc, "tail", None)
+    if tail:
+        parts.extend(str(x) for x in tail)
+    return "\n".join(parts)
+
+
+def _should_retry_segment_with_fp32(
+    exc: BaseException,
+    *,
+    primary_onnx_path: Path,
+    fallback_onnx_path: Path,
+) -> bool:
+    if primary_onnx_path == fallback_onnx_path:
+        return False
+
+    text = _exception_text(exc)
+    return any(
+        marker in text
+        for marker in (
+            "[tract] Failed analyse",
+            "Failed analyse for node",
+            "Translating node #",
+        )
+    )
+
+
+def _raise_resplit_for_killed_cli(
+    cli_err: CLICommandFailed,
+    *,
+    segment_idx: int,
+    stage: str,
+    logrows: Optional[int],
+    split_tuning: Optional[SplitTuning],
+) -> None:
+    if cli_err.returncode == -9 and split_tuning is not None:
+        raise SegmentNeedsResplitError(
+            segment_idx=segment_idx,
+            stage=stage,
+            reason=f"{stage} killed with rc={cli_err.returncode}",
+            logrows=logrows,
+            split_tuning=split_tuning,
+        ) from cli_err
+
+
 class SegmentNeedsResplitError(RuntimeError):
     def __init__(
         self,
@@ -820,6 +866,26 @@ def _calibration_knobs_from_env() -> Dict[str, Any]:
     return out
 
 
+def _effective_calibration_knobs(*, split_tuning: Optional[SplitTuning]) -> Dict[str, Any]:
+    out = _calibration_knobs_from_env()
+    if split_tuning is None or split_tuning.max_logrows is None:
+        return out
+
+    # Feed the split logrow cap into calibration so EZKL can auto-widen
+    # num_inner_cols before we reject an oversized segment after the fact.
+    split_cap = int(split_tuning.max_logrows)
+    requested = out.get("max_logrows")
+    if requested is None:
+        out["max_logrows"] = split_cap
+        return out
+
+    try:
+        out["max_logrows"] = min(int(requested), split_cap)
+    except Exception:
+        out["max_logrows"] = split_cap
+    return out
+
+
 def _run_single_onnx_pipeline(
     *,
     spec: ModelSpec,
@@ -862,7 +928,7 @@ def _run_single_onnx_pipeline(
     # --- Step 7: probabilistic execution knobs from CLI/env ---
     prob_overrides = _probabilistic_overrides_from_env()
     seg_meta["probabilistic_overrides"] = dict(prob_overrides)
-    calib_knobs = _calibration_knobs_from_env()
+    calib_knobs = _effective_calibration_knobs(split_tuning=split_tuning)
     seg_meta["calibration_knobs"] = dict(calib_knobs)
     output_visibility = _effective_output_visibility(segment_pos=segment_pos, segment_count=segment_count)
     seg_meta["output_visibility"] = output_visibility
@@ -1208,14 +1274,13 @@ def _run_single_onnx_pipeline(
                     ]
                 )
             except CLICommandFailed as cli_err:
-                if cli_err.returncode == -9 and split_tuning is not None:
-                    raise SegmentNeedsResplitError(
-                        segment_idx=segment_idx,
-                        stage="setup",
-                        reason=f"setup killed with rc={cli_err.returncode}",
-                        logrows=seg_logrows,
-                        split_tuning=split_tuning,
-                    ) from cli_err
+                _raise_resplit_for_killed_cli(
+                    cli_err,
+                    segment_idx=segment_idx,
+                    stage="setup",
+                    logrows=seg_logrows,
+                    split_tuning=split_tuning,
+                )
                 raise
             ok = True
     seg_meta["setup_time_s"] = float(t["elapsed"] or 0.0)
@@ -1237,22 +1302,32 @@ def _run_single_onnx_pipeline(
             )
         except Exception as e:
             logger.warning("gen_witness python call failed (%s); falling back to CLI", e)
-            _run_cli_checked(
-                [
-                    "ezkl",
-                    "gen-witness",
-                    "-M",
-                    str(compiled_path),
-                    "-D",
-                    str(input_path),
-                    "--output",
-                    str(witness_path),
-                    "--vk-path",
-                    str(vk_path),
-                    "--srs-path",
-                    str(srs_path),
-                ]
-            )
+            try:
+                _run_cli_checked(
+                    [
+                        "ezkl",
+                        "gen-witness",
+                        "-M",
+                        str(compiled_path),
+                        "-D",
+                        str(input_path),
+                        "--output",
+                        str(witness_path),
+                        "--vk-path",
+                        str(vk_path),
+                        "--srs-path",
+                        str(srs_path),
+                    ]
+                )
+            except CLICommandFailed as cli_err:
+                _raise_resplit_for_killed_cli(
+                    cli_err,
+                    segment_idx=segment_idx,
+                    stage="gen_witness",
+                    logrows=seg_logrows,
+                    split_tuning=split_tuning,
+                )
+                raise
             ok = True
     seg_meta["gen_witness_time_s"] = float(t["elapsed"] or 0.0)
     if not ok:
@@ -1304,22 +1379,32 @@ def _run_single_onnx_pipeline(
             )
         except Exception as e:
             logger.warning("warmup prove python call failed (%s); falling back to CLI", e)
-            _run_cli_checked(
-                [
-                    "ezkl",
-                    "prove",
-                    "-M",
-                    str(compiled_path),
-                    "--witness",
-                    str(witness_path),
-                    "--pk-path",
-                    str(pk_path),
-                    "--proof-path",
-                    str(proof_path),
-                    "--srs-path",
-                    str(srs_path),
-                ]
-            )
+            try:
+                _run_cli_checked(
+                    [
+                        "ezkl",
+                        "prove",
+                        "-M",
+                        str(compiled_path),
+                        "--witness",
+                        str(witness_path),
+                        "--pk-path",
+                        str(pk_path),
+                        "--proof-path",
+                        str(proof_path),
+                        "--srs-path",
+                        str(srs_path),
+                    ]
+                )
+            except CLICommandFailed as cli_err:
+                _raise_resplit_for_killed_cli(
+                    cli_err,
+                    segment_idx=segment_idx,
+                    stage="warmup_prove",
+                    logrows=seg_logrows,
+                    split_tuning=split_tuning,
+                )
+                raise
             ok = True
         if not ok:
             raise RuntimeError("Warmup prove failed")
@@ -1337,20 +1422,30 @@ def _run_single_onnx_pipeline(
             )
         except Exception as e:
             logger.warning("warmup verify python call failed (%s); falling back to CLI", e)
-            _run_cli_checked(
-                [
-                    "ezkl",
-                    "verify",
-                    "--proof-path",
-                    str(proof_path),
-                    "--settings-path",
-                    str(settings_path),
-                    "--vk-path",
-                    str(vk_path),
-                    "--srs-path",
-                    str(srs_path),
-                ]
-            )
+            try:
+                _run_cli_checked(
+                    [
+                        "ezkl",
+                        "verify",
+                        "--proof-path",
+                        str(proof_path),
+                        "--settings-path",
+                        str(settings_path),
+                        "--vk-path",
+                        str(vk_path),
+                        "--srs-path",
+                        str(srs_path),
+                    ]
+                )
+            except CLICommandFailed as cli_err:
+                _raise_resplit_for_killed_cli(
+                    cli_err,
+                    segment_idx=segment_idx,
+                    stage="warmup_verify",
+                    logrows=seg_logrows,
+                    split_tuning=split_tuning,
+                )
+                raise
             ok = True
         if not ok:
             raise RuntimeError("Warmup verify failed")
@@ -1369,22 +1464,32 @@ def _run_single_onnx_pipeline(
                 )
             except Exception as e:
                 logger.warning("prove python call failed (%s); falling back to CLI", e)
-                _run_cli_checked(
-                    [
-                        "ezkl",
-                        "prove",
-                        "-M",
-                        str(compiled_path),
-                        "--witness",
-                        str(witness_path),
-                        "--pk-path",
-                        str(pk_path),
-                        "--proof-path",
-                        str(proof_path),
-                        "--srs-path",
-                        str(srs_path),
-                    ]
-                )
+                try:
+                    _run_cli_checked(
+                        [
+                            "ezkl",
+                            "prove",
+                            "-M",
+                            str(compiled_path),
+                            "--witness",
+                            str(witness_path),
+                            "--pk-path",
+                            str(pk_path),
+                            "--proof-path",
+                            str(proof_path),
+                            "--srs-path",
+                            str(srs_path),
+                        ]
+                    )
+                except CLICommandFailed as cli_err:
+                    _raise_resplit_for_killed_cli(
+                        cli_err,
+                        segment_idx=segment_idx,
+                        stage="prove",
+                        logrows=seg_logrows,
+                        split_tuning=split_tuning,
+                    )
+                    raise
                 ok = True
         if not ok:
             raise RuntimeError("ezkl.prove returned false")
@@ -1404,20 +1509,30 @@ def _run_single_onnx_pipeline(
                 )
             except Exception as e:
                 logger.warning("verify python call failed (%s); falling back to CLI", e)
-                _run_cli_checked(
-                    [
-                        "ezkl",
-                        "verify",
-                        "--proof-path",
-                        str(proof_path),
-                        "--settings-path",
-                        str(settings_path),
-                        "--vk-path",
-                        str(vk_path),
-                        "--srs-path",
-                        str(srs_path),
-                    ]
-                )
+                try:
+                    _run_cli_checked(
+                        [
+                            "ezkl",
+                            "verify",
+                            "--proof-path",
+                            str(proof_path),
+                            "--settings-path",
+                            str(settings_path),
+                            "--vk-path",
+                            str(vk_path),
+                            "--srs-path",
+                            str(srs_path),
+                        ]
+                    )
+                except CLICommandFailed as cli_err:
+                    _raise_resplit_for_killed_cli(
+                        cli_err,
+                        segment_idx=segment_idx,
+                        stage="verify",
+                        logrows=seg_logrows,
+                        split_tuning=split_tuning,
+                    )
+                    raise
                 ok = True
         if not ok:
             raise RuntimeError("ezkl.verify returned false")
@@ -1604,9 +1719,12 @@ def run_single_model(
 
             _export_onnx(model, dummy, onnx_path_fp32)
 
-            # Post-export sanitize: shape/type inference + optional Gemm rewrite for tract stability.
+            # Post-export sanitize: shape/type inference + optional Conv/BatchNorm/Gemm rewrites
+            # for split friendliness and tract stability.
             sanitize_exported_onnx_inplace(
                 onnx_path_fp32,
+                rewrite_batchnorm=bool(spec.rewrite_batchnorm),
+                rewrite_conv_max_macs=spec.rewrite_conv_max_macs,
                 rewrite_gemm=bool(spec.rewrite_gemm),
             )
 
@@ -1784,6 +1902,7 @@ def run_single_model(
             try:
                 for seg_pos, seg in enumerate(segments_ezkl):
                     seg_path = Path(seg.onnx_path)
+                    seg_fp32_path = Path(segments_fp32[seg_pos].onnx_path)
                     seg_work_dir = ensure_dir(model_dir / "segments" / f"seg_{seg.idx:03d}")
                     logger.info(
                         "Running EZKL segment %s/%s: onnx=%s params=%.3fM nodes=%s work_dir=%s",
@@ -1795,22 +1914,64 @@ def run_single_model(
                         seg_work_dir,
                     )
 
-                    seg_meta, seg_prove, seg_verify = _run_single_onnx_pipeline(
-                        spec=spec,
-                        segment_pos=seg_pos,
-                        segment_idx=seg.idx,
-                        segment_count=len(segments_ezkl),
-                        onnx_path=seg_path,
-                        input_json_payload=seg_inputs_payloads[seg_pos],
-                        work_dir=seg_work_dir,
-                        artifacts_root=artifacts_root,
-                        repeats=repeats,
-                        warmup=warmup,
-                        explicit_logrows=explicit_logrows,
-                        split_tuning=current_split_tuning if split_enabled else None,
-                        skip_verify=skip_verify,
-                        skip_mock=effective_skip_mock,
-                    )
+                    seg_meta = None
+                    seg_prove = None
+                    seg_verify = None
+                    primary_exc: Optional[BaseException] = None
+
+                    candidate_paths = [seg_path]
+                    if seg_fp32_path != seg_path:
+                        candidate_paths.append(seg_fp32_path)
+
+                    for candidate_idx, candidate_path in enumerate(candidate_paths):
+                        try:
+                            seg_meta, seg_prove, seg_verify = _run_single_onnx_pipeline(
+                                spec=spec,
+                                segment_pos=seg_pos,
+                                segment_idx=seg.idx,
+                                segment_count=len(segments_ezkl),
+                                onnx_path=candidate_path,
+                                input_json_payload=seg_inputs_payloads[seg_pos],
+                                work_dir=seg_work_dir,
+                                artifacts_root=artifacts_root,
+                                repeats=repeats,
+                                warmup=warmup,
+                                explicit_logrows=explicit_logrows,
+                                split_tuning=current_split_tuning if split_enabled else None,
+                                skip_verify=skip_verify,
+                                skip_mock=effective_skip_mock,
+                            )
+                            if candidate_idx > 0 and seg_meta is not None:
+                                seg_meta["onnx_precision_fallback"] = {
+                                    "from": str(seg_path),
+                                    "to": str(candidate_path),
+                                    "reason": "tract_analysis_failure",
+                                }
+                            break
+                        except Exception as e:
+                            if (
+                                candidate_idx == 0
+                                and len(candidate_paths) > 1
+                                and _should_retry_segment_with_fp32(
+                                    e,
+                                    primary_onnx_path=seg_path,
+                                    fallback_onnx_path=seg_fp32_path,
+                                )
+                            ):
+                                logger.warning(
+                                    "Segment %s hit a tract-analysis failure on converted ONNX %s; retrying with fp32 split segment %s",
+                                    seg.idx,
+                                    seg_path,
+                                    seg_fp32_path,
+                                )
+                                primary_exc = e
+                                continue
+                            raise
+
+                    if seg_meta is None or seg_prove is None or seg_verify is None:
+                        if primary_exc is not None:
+                            raise primary_exc
+                        raise RuntimeError(f"Segment {seg.idx} produced no pipeline result")
 
                     seg_meta["segment_idx"] = seg.idx
                     seg_meta["segment_param_count"] = seg.param_count

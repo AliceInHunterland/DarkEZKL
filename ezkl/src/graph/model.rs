@@ -3,7 +3,7 @@ use super::extract_const_quantized_values;
 use super::node::*;
 use super::vars::*;
 use super::{ExecutionMode, GraphSettings, ProbabilisticSettings, GLOBAL_SETTINGS};
-use crate::circuit::einsum::analysis::analyze_einsum_usage;
+use crate::circuit::einsum::analysis::{analyze_einsum_usage, is_matmul_candidate_for_freivalds};
 use crate::circuit::hybrid::HybridOp;
 use crate::circuit::poly::PolyOp;
 use crate::circuit::region::ConstantsMap;
@@ -143,7 +143,11 @@ fn node_has_enabled_probabilistic_op(node: &NodeType, prob_ops: &crate::ProbOps)
 
             let matmul_or_gemm_enabled = (prob_ops.contains(crate::ProbOp::MatMul)
                 || prob_ops.contains(crate::ProbOp::Gemm))
-                && matches!(&n.opkind, SupportedOp::Linear(PolyOp::Einsum { .. }));
+                && matches!(
+                    &n.opkind,
+                    SupportedOp::Linear(PolyOp::Einsum { equation })
+                        if is_matmul_candidate_for_freivalds(equation)
+                );
 
             conv_enabled || matmul_or_gemm_enabled
         }
@@ -181,6 +185,62 @@ pub(crate) fn effective_run_args_for_model(model: &Model, run_args: &RunArgs) ->
     }
 
     effective
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn einsum_only_model(equation: &str) -> Model {
+        let node = Node {
+            opkind: SupportedOp::Linear(PolyOp::Einsum {
+                equation: equation.to_string(),
+            }),
+            out_scale: 0,
+            inputs: vec![],
+            out_dims: vec![1, 1],
+            idx: 0,
+            num_uses: 1,
+        };
+
+        Model {
+            graph: ParsedNodes {
+                nodes: BTreeMap::from([(0, NodeType::Node(node))]),
+                inputs: vec![],
+                outputs: vec![],
+                output_types: vec![],
+            },
+            visibility: VarVisibility::default(),
+        }
+    }
+
+    fn probabilistic_matmul_run_args() -> RunArgs {
+        RunArgs {
+            execution_mode: ExecutionMode::Probabilistic,
+            prob_k: 2,
+            prob_ops: crate::ProbOps(vec![crate::ProbOp::MatMul, crate::ProbOp::Gemm]),
+            ..RunArgs::default()
+        }
+    }
+
+    #[test]
+    fn unsupported_einsum_segment_is_demoted_to_exact() {
+        let model = einsum_only_model("NIHW,OI->NOHW");
+        let effective = effective_run_args_for_model(&model, &probabilistic_matmul_run_args());
+
+        assert_eq!(effective.execution_mode, ExecutionMode::Exact);
+        assert!(effective.disable_freivalds);
+    }
+
+    #[test]
+    fn matmul_einsum_segment_keeps_probabilistic_mode() {
+        let model = einsum_only_model("ij,jk->ik");
+        let effective = effective_run_args_for_model(&model, &probabilistic_matmul_run_args());
+
+        assert_eq!(effective.execution_mode, ExecutionMode::Probabilistic);
+        assert!(!effective.disable_freivalds);
+    }
 }
 
 /// Log a soundness budget estimate (union bound) for probabilistic execution.
