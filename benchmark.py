@@ -36,6 +36,7 @@ DEFAULT_EXECUTION_MODE = "probabilistic"
 DEFAULT_MODELS: List[str] = ["lenet-5-small", "repvgg-a0", "vit"]
 DEFAULT_PROB_K_VALUES: List[int] = [2, 4]
 DEFAULT_RUNS_PER_CASE: int = 3
+DEFAULT_PROB_OPS: List[str] = ["MatMul", "Gemm", "Conv"]
 
 
 # -----------------------------------------------------------------------------
@@ -180,6 +181,15 @@ def _parse_csv_ints(s: str) -> List[int]:
     for tok in _parse_csv_list(s):
         out.append(int(tok))
     return out
+
+
+def _default_prob_ops_for_model(model_name: str) -> List[str]:
+    key = (model_name or "").strip().lower()
+    if key in {"repvgg", "repvgg-a0", "repvgg_a0"}:
+        # RepVGG currently proves reliably with probabilistic matmul/gemm, but
+        # the first conv-heavy split segment still hits a halo2 synthesis error.
+        return ["MatMul", "Gemm"]
+    return list(DEFAULT_PROB_OPS)
 
 
 def _mean_std(values: List[float]) -> Tuple[Optional[float], Optional[float]]:
@@ -960,7 +970,12 @@ def main() -> int:
 
     # Execution controls
     ap.add_argument("--cache-dir", default="", help="Cache dir for weights/datasets (vit/repvgg/lenet models).")
-    ap.add_argument("--prob-ops", default="MatMul,Gemm,Conv", help="Comma-separated ops to run probabilistically")
+    ap.add_argument(
+        "--prob-ops",
+        default=os.environ.get("EZKL_PROB_OPS", ""),
+        help="Comma-separated ops to run probabilistically. Empty uses model defaults "
+        "(RepVGG: MatMul,Gemm; others: MatMul,Gemm,Conv).",
+    )
     ap.add_argument("--prob-seed-mode", default="fiat_shamir", help="Seed mode (e.g. fiat_shamir, public_seed)")
 
     ap.add_argument("--skip-verify", action="store_true", help="Skip verify (not recommended)")
@@ -1002,7 +1017,7 @@ def main() -> int:
         raise SystemExit("--runs/--repeats must be a positive integer")
 
     cache_dir = Path(args.cache_dir) if str(args.cache_dir).strip() else None
-    prob_ops = _parse_csv_list(args.prob_ops) or ["MatMul", "Gemm", "Conv"]
+    requested_prob_ops = _parse_csv_list(args.prob_ops)
     prob_seed_mode = str(args.prob_seed_mode).strip() or "fiat_shamir"
     split_enabled = _split_enabled_from_env()
     auto_skip_mock = bool(split_enabled) and (DEFAULT_EXECUTION_MODE == "probabilistic")
@@ -1026,7 +1041,8 @@ def main() -> int:
         "models": models,
         "prob_k_values": prob_k_values,
         "runs_per_case": runs,
-        "prob_ops": prob_ops,
+        "prob_ops": requested_prob_ops,
+        "prob_ops_mode": "explicit" if requested_prob_ops else "model-defaults",
         "prob_seed_mode": prob_seed_mode,
         "split_onnx": bool(split_enabled),
         "isolate_models": isolate,
@@ -1050,6 +1066,10 @@ def main() -> int:
     print(f"  Total cases: {total_cases}")
     print(f"  Isolation: {isolate}")
     print(f"  split_onnx: {split_enabled}")
+    if requested_prob_ops:
+        print(f"  prob_ops: {requested_prob_ops} (explicit)")
+    else:
+        print("  prob_ops: model defaults (repvgg-a0 -> MatMul,Gemm; others -> MatMul,Gemm,Conv)")
     print(f"  skip_mock(requested/effective): {requested_skip_mock}/{effective_skip_mock}")
     if auto_skip_mock and not requested_skip_mock:
         print("  NOTE: forcing --skip-mock for split+probabilistic run to avoid mock(seg_000) blocker")
@@ -1061,9 +1081,11 @@ def main() -> int:
                 case_counter += 1
                 run_dir = outdir / "runs" / str(model_name) / f"k{int(prob_k)}" / f"run{int(run_index)}"
                 _ensure_dir(run_dir)
+                case_prob_ops = requested_prob_ops or _default_prob_ops_for_model(str(model_name))
 
                 print(f"\n[{case_counter}/{total_cases}] Running: model={model_name}, prob_k={prob_k}, run={run_index}")
                 print(f"  Output dir: {run_dir}")
+                print(f"  prob_ops for case: {case_prob_ops}")
                 case_start = time.perf_counter()
 
                 if isolate:
@@ -1073,7 +1095,7 @@ def main() -> int:
                         run_index=int(run_index),
                         out_dir=run_dir,
                         cache_dir=cache_dir,
-                        prob_ops=prob_ops,
+                        prob_ops=case_prob_ops,
                         prob_seed_mode=prob_seed_mode,
                         skip_verify=bool(args.skip_verify),
                         skip_mock=bool(effective_skip_mock),
@@ -1087,7 +1109,7 @@ def main() -> int:
                         run_index=int(run_index),
                         out_dir=run_dir,
                         cache_dir=cache_dir,
-                        prob_ops=prob_ops,
+                        prob_ops=case_prob_ops,
                         prob_seed_mode=prob_seed_mode,
                         skip_verify=bool(args.skip_verify),
                         skip_mock=bool(effective_skip_mock),

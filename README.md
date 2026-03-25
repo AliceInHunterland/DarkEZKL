@@ -235,6 +235,12 @@ Depending on the model, first run may download:
 
 Mounting `./cache:/app/.cache` avoids redownloading.
 
+Important:
+- If you run with `HF_HUB_OFFLINE=1` and the required pretrained weights are not already cached,
+  some loaders may fall back to `pretrained=False`.
+- That is acceptable for pipeline smoke tests, but it is not representative if you intend to
+  benchmark the pretrained model itself. Warm the cache once online first, then rerun offline.
+
 ### 2) SRS downloads / materialization can be large (and can look "stuck")
 `ezkl get-srs` needs an SRS for the chosen `logrows` (`k`).
 

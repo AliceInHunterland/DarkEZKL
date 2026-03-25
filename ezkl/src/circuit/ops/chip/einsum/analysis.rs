@@ -314,6 +314,14 @@ fn is_matmul_candidate_for_freivalds(equation: &str) -> bool {
         .filter(|ch| b_set.contains(ch))
         .collect();
 
+    // Current Freivalds lowering is restricted to classic matmul / batched matmul style shapes.
+    // Conv-like projections such as `NIHW,OI->NOHW` flatten multiple independent "left" axes into
+    // the matrix row dimension and have been observed to fail later during proving. We also keep
+    // pure batched inner products (no left/right axes) on the exact path.
+    if left_set.len() > 1 || right_set.len() > 1 || (left_set.is_empty() && right_set.is_empty()) {
+        return false;
+    }
+
     // Validate output indices: must be exactly batch ∪ left ∪ right, and exclude contract.
     let mut expected_out: HashSet<char> = HashSet::new();
     expected_out.extend(batch_set.iter().copied());
@@ -351,4 +359,25 @@ fn has_duplicate_chars(axes: &[char]) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_matmul_candidate_for_freivalds;
+
+    #[test]
+    fn accepts_classic_batched_matmul_shapes() {
+        assert!(is_matmul_candidate_for_freivalds("ij,jk->ik"));
+        assert!(is_matmul_candidate_for_freivalds("bij,bjk->bik"));
+    }
+
+    #[test]
+    fn rejects_conv_like_projected_matmul_shapes() {
+        assert!(!is_matmul_candidate_for_freivalds("NIHW,OI->NOHW"));
+    }
+
+    #[test]
+    fn rejects_pure_batched_inner_products() {
+        assert!(!is_matmul_candidate_for_freivalds("abcde,abcde->abcd"));
+    }
 }

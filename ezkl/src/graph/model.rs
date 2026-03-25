@@ -5,6 +5,7 @@ use super::vars::*;
 use super::{ExecutionMode, GraphSettings, ProbabilisticSettings, GLOBAL_SETTINGS};
 use crate::circuit::einsum::analysis::analyze_einsum_usage;
 use crate::circuit::hybrid::HybridOp;
+use crate::circuit::poly::PolyOp;
 use crate::circuit::region::ConstantsMap;
 use crate::circuit::region::RegionCtx;
 use crate::circuit::region::RegionSettings;
@@ -107,6 +108,7 @@ fn settings_snapshot_from_run_args(run_args: &RunArgs) -> GraphSettings {
         k_repetitions: gs.prob_k,
         seed_mode: run_args.prob_seed_mode,
     };
+    gs.check_mode = run_args.check_mode;
 
     // Ensure the run_args snapshot is internally consistent with the top-level fields,
     // since other codepaths read from run_args.
@@ -114,8 +116,71 @@ fn settings_snapshot_from_run_args(run_args: &RunArgs) -> GraphSettings {
     gs.run_args.prob_k = gs.prob_k as _;
     gs.run_args.prob_seed_mode = gs.probabilistic_settings.seed_mode;
     gs.run_args.prob_ops = gs.prob_ops.clone();
+    gs.run_args.check_mode = gs.check_mode;
 
     gs
+}
+
+fn format_graph_error_with_sources(err: &dyn std::error::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut current = err.source();
+    while let Some(src) = current {
+        parts.push(src.to_string());
+        current = src.source();
+    }
+    parts.join(" | caused by: ")
+}
+
+fn node_has_enabled_probabilistic_op(node: &NodeType, prob_ops: &crate::ProbOps) -> bool {
+    match node {
+        NodeType::Node(n) => {
+            let conv_enabled = prob_ops.contains(crate::ProbOp::Conv)
+                && matches!(
+                    &n.opkind,
+                    SupportedOp::Linear(PolyOp::Conv { .. })
+                        | SupportedOp::Linear(PolyOp::DeConv { .. })
+                );
+
+            let matmul_or_gemm_enabled = (prob_ops.contains(crate::ProbOp::MatMul)
+                || prob_ops.contains(crate::ProbOp::Gemm))
+                && matches!(&n.opkind, SupportedOp::Linear(PolyOp::Einsum { .. }));
+
+            conv_enabled || matmul_or_gemm_enabled
+        }
+        NodeType::SubGraph { model, .. } => model_has_enabled_probabilistic_ops(model, prob_ops),
+    }
+}
+
+fn model_has_enabled_probabilistic_ops(model: &Model, prob_ops: &crate::ProbOps) -> bool {
+    model
+        .graph
+        .nodes
+        .values()
+        .any(|node| node_has_enabled_probabilistic_op(node, prob_ops))
+}
+
+/// Derive the effective run arguments for a concrete graph/segment.
+///
+/// Important benchmark fix:
+/// If `execution_mode=probabilistic` was requested, but this graph/segment has
+/// no *original* ops matching `prob_ops`, then we forcibly disable Freivalds.
+/// This prevents Conv-internal einsum lowerings from accidentally taking the
+/// probabilistic path when the user only enabled MatMul/Gemm.
+pub(crate) fn effective_run_args_for_model(model: &Model, run_args: &RunArgs) -> RunArgs {
+    let mut effective = run_args.clone();
+
+    if effective.execution_mode == ExecutionMode::Probabilistic
+        && !model_has_enabled_probabilistic_ops(model, &effective.prob_ops)
+    {
+        info!(
+            "execution_mode=probabilistic requested, but this concrete graph/segment has no original ops matching prob_ops={}; demoting this graph/segment to exact execution and forcing disable_freivalds=true so internal conv/einsum lowerings cannot accidentally take probabilistic paths",
+            effective.prob_ops
+        );
+        effective.execution_mode = ExecutionMode::Exact;
+        effective.disable_freivalds = true;
+    }
+
+    effective
 }
 
 /// Log a soundness budget estimate (union bound) for probabilistic execution.
@@ -669,6 +734,8 @@ impl Model {
         run_args: &RunArgs,
         check_mode: CheckMode,
     ) -> Result<GraphSettings, GraphError> {
+        let effective_run_args = effective_run_args_for_model(self, run_args);
+
         let instance_shapes = self.instance_shapes()?;
         #[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
         debug!(
@@ -701,30 +768,33 @@ impl Model {
             .collect::<Result<Vec<_>, GraphError>>()?;
 
         let res = self.dummy_layout(
-            run_args,
+            &effective_run_args,
             &inputs,
-            RegionSettings::all_false(run_args.decomp_base, run_args.decomp_legs),
+            RegionSettings::all_false(
+                effective_run_args.decomp_base,
+                effective_run_args.decomp_legs,
+            ),
         )?;
 
         // Step 9: log an auditable soundness budget (union bound) for probabilistic execution.
         // This provides visibility into the effective security level implied by (N checks, k repetitions).
-        log_probabilistic_soundness_budget(run_args, &res);
+        log_probabilistic_soundness_budget(&effective_run_args, &res);
 
         // if we're using percentage tolerance, we need to add the necessary range check ops for it.
 
         let probabilistic_settings = ProbabilisticSettings {
-            k_repetitions: run_args.prob_k as u32,
-            seed_mode: run_args.prob_seed_mode,
+            k_repetitions: effective_run_args.prob_k as u32,
+            seed_mode: effective_run_args.prob_seed_mode,
         };
 
         Ok(GraphSettings {
-            run_args: run_args.clone(),
+            run_args: effective_run_args.clone(),
 
             // Step 6: propagate probabilistic execution contract fields into settings.json
             // so they can be audited and used during configuration/layout.
-            execution_mode: run_args.execution_mode,
+            execution_mode: effective_run_args.execution_mode,
             prob_k: probabilistic_settings.k_repetitions,
-            prob_ops: run_args.prob_ops.clone(),
+            prob_ops: effective_run_args.prob_ops.clone(),
             probabilistic_settings,
 
             model_instance_shapes: instance_shapes,
@@ -767,11 +837,13 @@ impl Model {
         run_args: &RunArgs,
         region_settings: RegionSettings,
     ) -> Result<ForwardResult, GraphError> {
+        let effective_run_args = effective_run_args_for_model(self, run_args);
+
         let valtensor_inputs: Vec<ValTensor<Fp>> = model_inputs
             .iter()
             .map(|x| x.map(|elem| ValType::Value(Value::known(elem))).into())
             .collect();
-        let res = self.dummy_layout(run_args, &valtensor_inputs, region_settings)?;
+        let res = self.dummy_layout(&effective_run_args, &valtensor_inputs, region_settings)?;
         Ok(res.into())
     }
 
@@ -1262,13 +1334,16 @@ impl Model {
                     ((idx, equation.clone()), indices_to_dims.clone())
                 })
                 .collect();
-            let analysis = analyze_einsum_usage(
+            let mut analysis = analyze_einsum_usage(
                 &used_einsums,
-                &RegionSettings::all_true(
-                    settings.run_args.decomp_base,
-                    settings.run_args.decomp_legs,
-                ),
+                &RegionSettings::from_run_args(&settings.run_args, true, true),
             )?;
+            // Probabilistic einsum lowering can consume more column capacity than the
+            // structural reduction analysis predicts. The dummy pass already measured the
+            // real requirement, so use that as a lower bound during configure.
+            analysis.reduction_length = analysis
+                .reduction_length
+                .max(settings.einsum_params.total_einsum_col_size);
             base_gate.configure_einsums(meta, &analysis, num_inner_cols, logrows)?;
         }
 
@@ -1343,12 +1418,11 @@ impl Model {
         let outputs = layouter.assign_region(
             || "model",
             |region| {
-                let mut thread_safe_region = RegionCtx::new_with_challenges(
+                let mut thread_safe_region = RegionCtx::new_with_challenges_and_settings(
                     region,
                     0,
                     run_args.num_inner_cols,
-                    run_args.decomp_base,
-                    run_args.decomp_legs,
+                    RegionSettings::from_run_args(run_args, true, true),
                     challenges.clone(),
                 );
                 thread_safe_region.update_constants(original_constants.clone());
@@ -1358,7 +1432,9 @@ impl Model {
                 let outputs = self
                     .layout_nodes(&mut config, &mut thread_safe_region, &mut results)
                     .map_err(|e| {
-                        error!("{}", e);
+                        let detailed = format_graph_error_with_sources(&e);
+                        error!("{}", detailed);
+                        eprintln!("Graph model layout failed: {}", detailed);
                         halo2_proofs::plonk::Error::Synthesis
                     })?;
 
@@ -1396,7 +1472,9 @@ impl Model {
                         })
                         .collect::<Result<Vec<_>, GraphError>>();
                     res.map_err(|e| {
-                        error!("{}", e);
+                        let detailed = format_graph_error_with_sources(&e);
+                        error!("{}", detailed);
+                        eprintln!("Graph model layout failed: {}", detailed);
                         halo2_proofs::plonk::Error::Synthesis
                     })?;
                 }
@@ -1684,6 +1762,7 @@ impl Model {
             vars: ModelVars::new_dummy(),
         };
 
+        let region_settings = region_settings.with_run_args(run_args);
         let mut region = RegionCtx::new_dummy(0, run_args.num_inner_cols, region_settings);
 
         let outputs = self.layout_nodes(&mut model_config, &mut region, &mut results)?;

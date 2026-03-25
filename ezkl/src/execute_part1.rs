@@ -104,6 +104,25 @@ lazy_static::lazy_static! {
     };
 }
 
+fn env_check_mode_override() -> Option<CheckMode> {
+    std::env::var("EZKL_CHECK_MODE")
+        .ok()
+        .and_then(|raw| raw.parse::<CheckMode>().ok())
+}
+
+fn apply_env_check_mode_override(mut args: RunArgs) -> RunArgs {
+    if let Some(check_mode) = env_check_mode_override() {
+        args.check_mode = check_mode;
+    }
+    args
+}
+
+fn resolve_cli_check_mode(check_mode: Option<CheckMode>) -> CheckMode {
+    check_mode
+        .or_else(env_check_mode_override)
+        .unwrap_or_else(|| crate::DEFAULT_CHECKMODE.parse().unwrap())
+}
+
 /// Run an ezkl command with given args
 pub async fn run(command: Commands) -> Result<String, EZKLError> {
     #[cfg(feature = "gpu-accelerated")]
@@ -120,7 +139,10 @@ pub async fn run(command: Commands) -> Result<String, EZKLError> {
             settings_path,
             logrows,
         } => get_srs_cmd(srs_path, settings_path, logrows).await,
-        Commands::Table { model, args } => table(model.unwrap_or(crate::DEFAULT_MODEL.into()), args),
+        Commands::Table { model, args } => table(
+            model.unwrap_or(crate::DEFAULT_MODEL.into()),
+            apply_env_check_mode_override(args),
+        ),
         Commands::GenSettings {
             model,
             settings_path,
@@ -128,7 +150,7 @@ pub async fn run(command: Commands) -> Result<String, EZKLError> {
         } => gen_circuit_settings(
             model.unwrap_or(crate::DEFAULT_MODEL.into()),
             settings_path.unwrap_or(crate::DEFAULT_SETTINGS.into()),
-            args,
+            apply_env_check_mode_override(args),
         ),
         Commands::GenRandomData {
             model,
@@ -231,7 +253,7 @@ pub async fn run(command: Commands) -> Result<String, EZKLError> {
             pk_path.unwrap_or(crate::DEFAULT_PK.into()),
             Some(proof_path.unwrap_or(crate::DEFAULT_PROOF.into())),
             srs_path,
-            check_mode.unwrap_or(crate::DEFAULT_CHECKMODE.parse().unwrap()),
+            resolve_cli_check_mode(check_mode),
         )
         .map(|e| serde_json::to_string(&e).unwrap()),
         Commands::Verify {
@@ -1146,8 +1168,7 @@ pub(crate) fn gen_witness(
     let mut input = circuit.load_graph_input(&data)?;
 
     // if any of the settings have kzg visibility then we need to load the srs
-    let region_settings =
-        RegionSettings::all_true(settings.run_args.decomp_base, settings.run_args.decomp_legs);
+    let region_settings = RegionSettings::from_run_args(&settings.run_args, true, true);
 
     let start_time = Instant::now();
     let witness = if settings.module_requires_polycommit() {

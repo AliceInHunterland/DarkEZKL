@@ -1,18 +1,15 @@
 use super::*;
 
-#[test]
-fn test_graph_settings_serialization_roundtrip() {
-    use crate::{
-        CheckMode, ExecutionMode, ProbOp, ProbOps, ProbSeedMode, ProbabilisticSettings, RunArgs,
-    };
+fn sample_graph_settings(run_args_check_mode: CheckMode, check_mode: CheckMode) -> GraphSettings {
+    use crate::{ExecutionMode, ProbOp, ProbOps, ProbSeedMode, ProbabilisticSettings, RunArgs};
 
-    // Create a test GraphSettings with nested structs
-    let original = GraphSettings {
+    GraphSettings {
         run_args: RunArgs {
             execution_mode: ExecutionMode::Probabilistic,
             prob_k: 20,
             prob_seed_mode: ProbSeedMode::FiatShamir,
             prob_ops: ProbOps(vec![ProbOp::MatMul, ProbOp::Gemm]),
+            check_mode: run_args_check_mode,
             ..RunArgs::default()
         },
         execution_mode: ExecutionMode::Probabilistic,
@@ -41,13 +38,18 @@ fn test_graph_settings_serialization_roundtrip() {
         module_sizes: ModuleSizes::default(),
         required_lookups: vec![],
         required_range_checks: vec![],
-        check_mode: CheckMode::SAFE,
+        check_mode,
         version: "1.0.0".to_string(),
         num_blinding_factors: Some(5),
         timestamp: Some(123456789),
         input_types: None,
         output_types: None,
-    };
+    }
+}
+
+#[test]
+fn test_graph_settings_serialization_roundtrip() {
+    let original = sample_graph_settings(CheckMode::SAFE, CheckMode::SAFE);
 
     // Test 1: JSON serialization roundtrip with flattened format
     let json_str = serde_json::to_string_pretty(&original).unwrap();
@@ -171,4 +173,63 @@ fn test_graph_settings_serialization_roundtrip() {
 }"#;
 
     let _backwards_compatible: GraphSettings = serde_json::from_str(old_format_json).unwrap();
+}
+
+#[test]
+fn test_graph_settings_json_deserialize_prefers_top_level_check_mode() {
+    let mut value =
+        serde_json::to_value(sample_graph_settings(CheckMode::SAFE, CheckMode::UNSAFE)).unwrap();
+    value["run_args"]["check_mode"] = serde_json::json!("SAFE");
+    value["check_mode"] = serde_json::json!("UNSAFE");
+
+    let deserialized: GraphSettings = serde_json::from_value(value).unwrap();
+
+    assert_eq!(deserialized.check_mode, CheckMode::UNSAFE);
+    assert_eq!(deserialized.run_args.check_mode, CheckMode::UNSAFE);
+}
+
+#[test]
+fn test_graph_settings_bincode_deserialize_prefers_top_level_check_mode() {
+    use serde::ser::SerializeTuple;
+    use serde::Serialize;
+
+    struct LegacyGraphSettingsTuple<'a>(&'a GraphSettings);
+
+    impl Serialize for LegacyGraphSettingsTuple<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let settings = self.0;
+            let mut state = serializer.serialize_tuple(19)?;
+            state.serialize_element(&settings.run_args)?;
+            state.serialize_element(&settings.num_rows)?;
+            state.serialize_element(&settings.total_assignments)?;
+            state.serialize_element(&settings.total_const_size)?;
+            state.serialize_element(&settings.dynamic_lookup_params)?;
+            state.serialize_element(&settings.shuffle_params)?;
+            state.serialize_element(&settings.einsum_params)?;
+            state.serialize_element(&settings.model_instance_shapes)?;
+            state.serialize_element(&settings.model_output_scales)?;
+            state.serialize_element(&settings.model_input_scales)?;
+            state.serialize_element(&settings.module_sizes)?;
+            state.serialize_element(&settings.required_lookups)?;
+            state.serialize_element(&settings.required_range_checks)?;
+            state.serialize_element(&settings.check_mode)?;
+            state.serialize_element(&settings.version)?;
+            state.serialize_element(&settings.num_blinding_factors)?;
+            state.serialize_element(&settings.timestamp)?;
+            state.serialize_element(&settings.input_types)?;
+            state.serialize_element(&settings.output_types)?;
+            state.end()
+        }
+    }
+
+    let original = sample_graph_settings(CheckMode::SAFE, CheckMode::UNSAFE);
+    let data = bincode::serialize(&LegacyGraphSettingsTuple(&original)).unwrap();
+
+    let deserialized: GraphSettings = bincode::deserialize(&data).unwrap();
+
+    assert_eq!(deserialized.check_mode, CheckMode::UNSAFE);
+    assert_eq!(deserialized.run_args.check_mode, CheckMode::UNSAFE);
 }

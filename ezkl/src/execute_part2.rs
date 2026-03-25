@@ -394,7 +394,7 @@ pub(crate) fn calibrate(
                     &mut data,
                     None,
                     None,
-                    RegionSettings::all_true(local_run_args.decomp_base, local_run_args.decomp_legs),
+                    RegionSettings::from_run_args(&local_run_args, true, true),
                 ) {
                     Ok(r) => r,
                     Err(e) => {
@@ -811,8 +811,14 @@ pub(crate) fn compile_circuit(
     compiled_circuit: PathBuf,
     settings_path: PathBuf,
 ) -> Result<String, EZKLError> {
-    let settings = GraphSettings::load(&settings_path)?;
-    let circuit = GraphCircuit::from_settings(&settings, &model_path, CheckMode::UNSAFE)?;
+    let mut settings = GraphSettings::load(&settings_path)?;
+
+    if let Some(check_mode) = env_check_mode_override() {
+        settings.run_args.check_mode = check_mode;
+        settings.check_mode = check_mode;
+    }
+
+    let circuit = GraphCircuit::from_settings(&settings, &model_path, settings.check_mode)?;
     circuit.save(compiled_circuit)?;
     Ok(String::new())
 }

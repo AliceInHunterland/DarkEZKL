@@ -5,7 +5,7 @@ use crate::circuit::{BaseConfig, CheckMode, CircuitError};
 use crate::graph::config::{ProbOp, ProbOps, GLOBAL_SETTINGS};
 use crate::tensor::{Tensor, TensorError, TensorType, ValTensor, ValType, VarTensor};
 use crate::{ExecutionMode, ProbabilisticSettings};
-use analysis::{analyze_single_equation, EinsumAnalysis};
+use analysis::{analyze_single_equation_with_settings, EinsumAnalysis};
 use halo2_proofs::circuit::Value;
 use halo2_proofs::plonk::{
     Challenge, ConstraintSystem, Constraints, Expression, FirstPhase, Selector,
@@ -187,7 +187,11 @@ impl<F: PrimeField + TensorType + PartialOrd + std::hash::Hash> Einsums<F> {
                 });
             });
 
-        let equation_analysis = analyze_single_equation(&equation, &input_axes_to_dim)?;
+        let equation_analysis = analyze_single_equation_with_settings(
+            &equation,
+            &input_axes_to_dim,
+            region.settings(),
+        )?;
         let equation = equation_analysis.equation;
 
         // Remove trivial axes from tensors
@@ -1058,6 +1062,15 @@ fn layout_probabilistic_freivalds_matmul<
         .copied()
         .filter(|ch| contract_set.contains(ch))
         .collect_vec();
+
+    // Keep conv-like projections and pure batched inner products on the exact path until
+    // Freivalds lowering supports them robustly.
+    if left_axes.len() > 1
+        || right_axes.len() > 1
+        || (left_axes.is_empty() && right_axes.is_empty())
+    {
+        return Err(CircuitError::UnsupportedOp);
+    }
 
     // Validate "matmul-like": after removing batch axes, A should be (left, contract),
     // B should be (contract, right), C should be (left, right) (up to reordering).

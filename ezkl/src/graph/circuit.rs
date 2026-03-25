@@ -20,7 +20,7 @@ use crate::tensor::{Tensor, ValTensor};
 
 use super::errors::GraphError;
 use super::input::{FileSourceInner, GraphData};
-use super::model::{Model, ModelConfig};
+use super::model::{effective_run_args_for_model, Model, ModelConfig};
 use super::modules::{GraphModules, ModuleConfigs, ModuleForwardResult, ModuleSizes};
 use super::vars::VarVisibility;
 use super::{GraphSettings, GraphWitness};
@@ -39,6 +39,72 @@ pub struct GraphCircuit {
 
     #[serde(skip)]
     witness: Option<GraphWitness>,
+}
+
+fn sync_settings_execution_contract(settings: &mut GraphSettings) {
+    // Treat top-level settings as the canonical execution contract, then mirror them
+    // into run_args for older codepaths that still read from run_args.
+    settings.run_args.execution_mode = settings.execution_mode;
+    settings.run_args.prob_k = settings.prob_k as _;
+    settings.run_args.prob_seed_mode = settings.probabilistic_settings.seed_mode;
+    settings.run_args.prob_ops = settings.prob_ops.clone();
+    settings.run_args.check_mode = settings.check_mode;
+
+    settings.execution_mode = settings.run_args.execution_mode;
+    settings.prob_k = settings.run_args.prob_k as u32;
+    settings.prob_ops = settings.run_args.prob_ops.clone();
+    settings.probabilistic_settings.k_repetitions = settings.prob_k;
+    settings.probabilistic_settings.seed_mode = settings.run_args.prob_seed_mode;
+    settings.check_mode = settings.run_args.check_mode;
+}
+
+fn normalize_settings_for_model(
+    settings: &mut GraphSettings,
+    model: &Model,
+) -> Result<(), GraphError> {
+    let effective_run_args = effective_run_args_for_model(model, &settings.run_args);
+    let run_args_changed = effective_run_args != settings.run_args;
+
+    if run_args_changed {
+        log::info!(
+            "recomputing loaded circuit settings against actual model/segment: execution_mode={} -> {}, disable_freivalds={} -> {}, prob_ops={}",
+            settings.run_args.execution_mode,
+            effective_run_args.execution_mode,
+            settings.run_args.disable_freivalds,
+            effective_run_args.disable_freivalds,
+            effective_run_args.prob_ops,
+        );
+
+        let prev_num_blinding_factors = settings.num_blinding_factors;
+        let prev_timestamp = settings.timestamp;
+
+        let mut refreshed = model.gen_params(&effective_run_args, settings.check_mode)?;
+        refreshed.num_blinding_factors =
+            prev_num_blinding_factors.or(refreshed.num_blinding_factors);
+        refreshed.timestamp = prev_timestamp.or(refreshed.timestamp);
+
+        *settings = refreshed;
+    }
+
+    settings.module_sizes = GraphModules::num_constraints_and_instances(
+        model.graph.input_shapes()?,
+        model.const_shapes(),
+        model.graph.output_shapes()?,
+        model.visibility.clone(),
+    );
+
+    sync_settings_execution_contract(settings);
+    Ok(())
+}
+
+fn format_error_with_sources(err: &dyn std::error::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut current = err.source();
+    while let Some(src) = current {
+        parts.push(src.to_string());
+        current = src.source();
+    }
+    parts.join(" | caused by: ")
 }
 
 impl GraphCircuit {
@@ -214,7 +280,9 @@ impl GraphCircuit {
             GraphError::ReadWriteFileError(path.display().to_string(), e.to_string())
         })?;
         let reader = BufReader::new(f);
-        let c: GraphCircuit = bincode::deserialize_from(reader)?;
+        let mut c: GraphCircuit = bincode::deserialize_from(reader)?;
+
+        normalize_settings_for_model(&mut c.settings, &c.model)?;
 
         // Keep GLOBAL_SETTINGS in sync for subsequent `Circuit::configure` calls.
         super::GLOBAL_SETTINGS.with(|gs| {
@@ -231,13 +299,7 @@ impl GraphCircuit {
         let model = Model::from_run_args(run_args, model_path)?;
 
         let mut settings = model.gen_params(run_args, run_args.check_mode)?;
-        // Fill module sizing metadata (used for instance accounting / auditing).
-        settings.module_sizes = GraphModules::num_constraints_and_instances(
-            model.graph.input_shapes()?,
-            model.const_shapes(),
-            model.graph.output_shapes()?,
-            model.visibility.clone(),
-        );
+        normalize_settings_for_model(&mut settings, &model)?;
 
         // Keep GLOBAL_SETTINGS in sync for subsequent `Circuit::configure` calls.
         super::GLOBAL_SETTINGS.with(|gs| {
@@ -260,13 +322,7 @@ impl GraphCircuit {
         settings.check_mode = check_mode;
 
         let model = Model::from_run_args(&settings.run_args, model_path)?;
-
-        settings.module_sizes = GraphModules::num_constraints_and_instances(
-            model.graph.input_shapes()?,
-            model.const_shapes(),
-            model.graph.output_shapes()?,
-            model.visibility.clone(),
-        );
+        normalize_settings_for_model(&mut settings, &model)?;
 
         // Keep GLOBAL_SETTINGS in sync for subsequent `Circuit::configure` calls.
         super::GLOBAL_SETTINGS.with(|gs| {
@@ -601,7 +657,9 @@ impl Circuit<Fp> for GraphCircuit {
                 &mut constants,
             )
             .map_err(|e| {
-                log::error!("GraphCircuit synthesize failed: {e}");
+                let detailed = format_error_with_sources(&e);
+                log::error!("GraphCircuit synthesize failed: {detailed}");
+                eprintln!("GraphCircuit synthesize failed: {detailed}");
                 Error::Synthesis
             })?;
 

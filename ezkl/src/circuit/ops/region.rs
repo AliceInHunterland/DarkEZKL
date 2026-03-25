@@ -198,6 +198,35 @@ impl RegionSettings {
             prob_seed_mode: ProbSeedMode::PublicSeed,
         }
     }
+
+    /// Apply the execution contract from run args while preserving witness/range flags.
+    pub fn with_run_args(mut self, run_args: &crate::RunArgs) -> RegionSettings {
+        self.execution_mode = run_args.execution_mode;
+        self.prob_ops = run_args
+            .prob_ops
+            .0
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        self.prob_k = run_args.prob_k as u32;
+        self.prob_seed_mode = run_args.prob_seed_mode;
+        self
+    }
+
+    /// Build region settings directly from run args.
+    pub fn from_run_args(
+        run_args: &crate::RunArgs,
+        witness_gen: bool,
+        check_range: bool,
+    ) -> RegionSettings {
+        RegionSettings::new(
+            witness_gen,
+            check_range,
+            run_args.decomp_base,
+            run_args.decomp_legs,
+        )
+        .with_run_args(run_args)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -283,6 +312,11 @@ impl<'a, F: PrimeField + TensorType + PartialOrd + std::hash::Hash> RegionCtx<'a
     /// seed mode for probabilistic challenges for this region
     pub fn prob_seed_mode(&self) -> ProbSeedMode {
         self.settings.prob_seed_mode
+    }
+
+    /// Full settings for this region.
+    pub fn settings(&self) -> &RegionSettings {
+        &self.settings
     }
 
     #[cfg(all(feature = "ezkl", not(target_arch = "wasm32")))]
@@ -375,6 +409,21 @@ impl<'a, F: PrimeField + TensorType + PartialOrd + std::hash::Hash> RegionCtx<'a
         decomp_base: usize,
         decomp_legs: usize,
     ) -> RegionCtx<'a, F> {
+        Self::new_with_settings(
+            region,
+            row,
+            num_inner_cols,
+            RegionSettings::all_true(decomp_base, decomp_legs),
+        )
+    }
+
+    /// Create a new region context with explicit settings.
+    pub fn new_with_settings(
+        region: Region<'a, F>,
+        row: usize,
+        num_inner_cols: usize,
+        settings: RegionSettings,
+    ) -> RegionCtx<'a, F> {
         let region = Some(RefCell::new(region));
         let linear_coord = row * num_inner_cols;
 
@@ -387,7 +436,7 @@ impl<'a, F: PrimeField + TensorType + PartialOrd + std::hash::Hash> RegionCtx<'a
             shuffle_index: ShuffleIndex::default(),
             einsum_index: EinsumIndex::default(),
             statistics: RegionStatistics::default(),
-            settings: RegionSettings::all_true(decomp_base, decomp_legs),
+            settings,
             assigned_constants: HashMap::new(),
             challenges: vec![],
             max_dynamic_input_len: 0,
@@ -418,6 +467,19 @@ impl<'a, F: PrimeField + TensorType + PartialOrd + std::hash::Hash> RegionCtx<'a
         challenges: Vec<Value<F>>,
     ) -> RegionCtx<'a, F> {
         let mut new_self = Self::new(region, row, num_inner_cols, decomp_base, decomp_legs);
+        new_self.challenges = challenges;
+        new_self
+    }
+
+    /// Create a new region context with challenges and explicit settings.
+    pub fn new_with_challenges_and_settings(
+        region: Region<'a, F>,
+        row: usize,
+        num_inner_cols: usize,
+        settings: RegionSettings,
+        challenges: Vec<Value<F>>,
+    ) -> RegionCtx<'a, F> {
+        let mut new_self = Self::new_with_settings(region, row, num_inner_cols, settings);
         new_self.challenges = challenges;
         new_self
     }

@@ -190,5 +190,10 @@ Note: the suite is fixed; attempting to pass other `--prob-k-values` / `--runs` 
 - `constraint_count` is “best-effort”:
   - It is extracted by searching `settings.json` for fields containing “constraint”.
   - Some EZKL versions/settings shapes may not include constraints explicitly → value may be `null`.
+- Split / segmented pipelines normalize execution per concrete segment:
+  - if a split segment has no original ops matching the requested `prob_ops`,
+    Dark-EZKL now demotes that segment to exact execution.
+  - This prevents internal Conv/einsum lowerings from accidentally using probabilistic checks
+    just because the top-level run requested `execution_mode=probabilistic`.
 - `bench_metrics.json` plot payload:
   - For compatibility with existing plotting code, `benchmark.py` reuses a `logrows` field in the plot input to label entries by `prob_k` (i.e. `logrows = prob_k` in the plot payload). This is just for plotting labels; the actual `logrows` is preserved in per-run `vit_bench_report.json`.

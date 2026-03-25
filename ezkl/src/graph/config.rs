@@ -260,6 +260,7 @@ impl Serialize for GraphSettings {
         run_args.prob_k = self.prob_k as _;
         run_args.prob_seed_mode = self.probabilistic_settings.seed_mode;
         run_args.prob_ops = self.prob_ops.clone();
+        run_args.check_mode = self.check_mode;
 
         if serializer.is_human_readable() {
             // JSON format - use flattened fields for backwards compatibility
@@ -684,6 +685,8 @@ impl<'de> Deserialize<'de> for GraphSettings {
                     check_mode.ok_or_else(|| de::Error::missing_field("check_mode"))?;
                 let version = version.ok_or_else(|| de::Error::missing_field("version"))?;
 
+                run_args.check_mode = check_mode;
+
                 // Build the nested structs from flattened fields, with defaults if missing
                 let dynamic_lookup_params = DynamicLookupParams {
                     total_dynamic_col_size: total_dynamic_col_size.unwrap_or_default(),
@@ -811,6 +814,7 @@ impl<'de> Deserialize<'de> for GraphSettings {
                 run_args.prob_k = prob_k as _;
                 run_args.prob_seed_mode = probabilistic_settings.seed_mode;
                 run_args.prob_ops = prob_ops.clone();
+                run_args.check_mode = check_mode;
 
                 Ok(GraphSettings {
                     run_args,
