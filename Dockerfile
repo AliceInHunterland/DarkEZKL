@@ -93,32 +93,20 @@ RUN python3 -m pip install --upgrade pip && \
     python3 -m pip install \
       "maturin>=1.0,<2.0" \
       onnx \
-      "onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}" \
       onnxconverter-common \
+      "onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}" \
       numpy \
-      pandas \
       matplotlib \
-      seaborn \
-      tqdm \
       timm \
       huggingface_hub \
-      safetensors \
-      pytest \
-      pyyaml \
-      scipy \
-      jupyter \
-      kaggle \
-      py-solc-x \
-      web3 \
-      librosa \
-      keras
+      safetensors
 
 # ---- Runtime dirs ----
-RUN mkdir -p /app/.cache /app/results /app/artifacts /app/layer_setup
+RUN mkdir -p /app/.cache /app/results
 
 WORKDIR /app
 
-# Copy project code (benchmark.py etc.)
+# Copy project code.
 COPY . .
 
 # ---- Build & install ezkl CLI ----
@@ -264,7 +252,6 @@ except Exception as e:
 
 import ezkl
 import onnxruntime as ort
-import yaml
 
 print("torch:", torch.__version__)
 print("torchvision:", tv)

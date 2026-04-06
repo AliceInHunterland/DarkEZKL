@@ -2,6 +2,10 @@
 .github
 .gitlab
 .gitlab-ci.yml
+.idea
+.venv
+paper
+tmp
 
 results
 results/*

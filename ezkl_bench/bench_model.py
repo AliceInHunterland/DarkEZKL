@@ -204,7 +204,9 @@ def _segment_cache_key(
     calibration_knobs: Dict[str, Any],
     skip_mock: bool,
     skip_verify: bool,
+    input_visibility: str,
     output_visibility: str,
+    param_visibility: str,
 ) -> Dict[str, Any]:
     check_mode = (os.environ.get("EZKL_CHECK_MODE") or "safe").strip().lower()
     ignore_io_range = env_flag("EZKL_IGNORE_RANGE_CHECK_IO", default=(check_mode == "unsafe"))
@@ -220,7 +222,9 @@ def _segment_cache_key(
             "num_inner_cols": int(effective_num_inner_cols),
             "explicit_logrows": None if explicit_logrows is None else int(explicit_logrows),
             "check_mode": check_mode,
+            "input_visibility": str(input_visibility),
             "output_visibility": str(output_visibility),
+            "param_visibility": str(param_visibility),
             "ignore_range_check_inputs_outputs": bool(ignore_io_range),
             "prob_overrides": {
                 "execution_mode": prob_overrides.get("execution_mode"),
@@ -385,9 +389,9 @@ def _export_onnx(model, dummy_input, onnx_path: Path) -> None:
 
 def _probabilistic_overrides_from_env() -> Dict[str, Any]:
     """
-    Step 7 plumbing: parse benchmark-level probabilistic execution knobs from env vars.
+    Parse benchmark-level probabilistic execution knobs from env vars.
 
-    These env vars are set by ezkl_bench/cli.py so they also propagate into worker subprocesses:
+    These env vars are primarily set by the Docker/runtime command line:
       - EZKL_EXECUTION_MODE: exact|probabilistic
       - EZKL_PROB_K: integer
       - EZKL_PROB_OPS: comma-separated ops list (e.g. MatMul,Gemm,Conv)
@@ -663,6 +667,24 @@ def _effective_output_visibility(*, segment_pos: int, segment_count: int) -> str
     return "public"
 
 
+def _visibility_from_env(env_name: str, default: str) -> str:
+    raw = (os.environ.get(env_name) or "").strip().lower()
+    if not raw:
+        return str(default)
+    if raw not in {"public", "private", "fixed", "hashed"}:
+        logger.warning("Ignoring invalid %s=%r; using default=%s", env_name, raw, default)
+        return str(default)
+    return raw
+
+
+def _effective_input_visibility() -> str:
+    return _visibility_from_env("EZKL_INPUT_VISIBILITY", "private")
+
+
+def _effective_param_visibility() -> str:
+    return _visibility_from_env("EZKL_PARAM_VISIBILITY", "fixed")
+
+
 def _enforce_settings_output_visibility(settings_path: Path, output_visibility: str) -> None:
     try:
         settings = read_json(settings_path)
@@ -701,21 +723,23 @@ def _mk_run_args(spec: ModelSpec, explicit_logrows: Optional[int], output_visibi
         return None
 
     run_args = run_args_cls()
+    input_visibility = _effective_input_visibility()
+    param_visibility = _effective_param_visibility()
 
     # Visibility enums changed across versions; support both.
     if hasattr(ezkl, "PyVisibility"):
         try:
-            run_args.input_visibility = ezkl.PyVisibility.Private
+            run_args.input_visibility = getattr(ezkl.PyVisibility, str(input_visibility).capitalize())
             run_args.output_visibility = getattr(ezkl.PyVisibility, str(output_visibility).capitalize())
-            run_args.param_visibility = ezkl.PyVisibility.Fixed
+            run_args.param_visibility = getattr(ezkl.PyVisibility, str(param_visibility).capitalize())
         except Exception:
-            run_args.input_visibility = "private"
+            run_args.input_visibility = str(input_visibility)
             run_args.output_visibility = str(output_visibility)
-            run_args.param_visibility = "fixed"
+            run_args.param_visibility = str(param_visibility)
     else:
-        run_args.input_visibility = "private"
+        run_args.input_visibility = str(input_visibility)
         run_args.output_visibility = str(output_visibility)
-        run_args.param_visibility = "fixed"
+        run_args.param_visibility = str(param_visibility)
 
     # --- performance/defensiveness knobs (best-effort) ---
     check_mode = (os.environ.get("EZKL_CHECK_MODE") or "safe").strip().lower()
@@ -773,6 +797,8 @@ def _build_gen_settings_cli(
 ) -> List[str]:
     input_scale = _effective_input_scale(spec)
     param_scale = _effective_param_scale(spec)
+    input_visibility = _effective_input_visibility()
+    param_visibility = _effective_param_visibility()
     cmd = [
         "ezkl",
         "gen-settings",
@@ -787,11 +813,11 @@ def _build_gen_settings_cli(
         "--num-inner-cols",
         str(_effective_num_inner_cols(spec)),
         "--input-visibility",
-        "private",
+        str(input_visibility),
         "--output-visibility",
         str(output_visibility),
         "--param-visibility",
-        "fixed",
+        str(param_visibility),
         "--check-mode",
         (os.environ.get("EZKL_CHECK_MODE") or "safe").strip().lower(),
     ]
@@ -930,8 +956,12 @@ def _run_single_onnx_pipeline(
     seg_meta["probabilistic_overrides"] = dict(prob_overrides)
     calib_knobs = _effective_calibration_knobs(split_tuning=split_tuning)
     seg_meta["calibration_knobs"] = dict(calib_knobs)
+    input_visibility = _effective_input_visibility()
     output_visibility = _effective_output_visibility(segment_pos=segment_pos, segment_count=segment_count)
+    param_visibility = _effective_param_visibility()
+    seg_meta["input_visibility"] = input_visibility
     seg_meta["output_visibility"] = output_visibility
+    seg_meta["param_visibility"] = param_visibility
     seg_meta["segment_position"] = int(segment_pos)
     eff_input_scale = _effective_input_scale(spec)
     eff_param_scale = _effective_param_scale(spec)
@@ -962,7 +992,9 @@ def _run_single_onnx_pipeline(
         calibration_knobs=calib_knobs,
         skip_mock=skip_mock,
         skip_verify=skip_verify,
+        input_visibility=input_visibility,
         output_visibility=output_visibility,
+        param_visibility=param_visibility,
     )
     cached_segment = _load_cached_segment_result(
         work_dir=work_dir,
@@ -1587,7 +1619,23 @@ def _apply_precision_to_segments(
         for s in segments_fp32:
             src = Path(s.onnx_path)
             dst = out_dir / Path(s.onnx_path).name  # seg_XXX.onnx
-            convert_onnx_to_fp16(src, dst, keep_io_types=True)
+            try:
+                convert_onnx_to_fp16(src, dst, keep_io_types=True)
+            except ModuleNotFoundError as e:
+                if getattr(e, "name", "") != "onnxconverter_common":
+                    raise
+                warning = (
+                    "Split-mode fp16 conversion unavailable because onnxconverter_common is missing; "
+                    "falling back to fp32 split segments. Rebuild the Docker image to restore fp16 segment conversion."
+                )
+                logger.warning("%s", warning)
+                return segments_fp32, {
+                    "mode": "fp32",
+                    "requested": mode,
+                    "segments": [],
+                    "warning": warning,
+                    "error": f"{type(e).__name__}: {e}",
+                }
             # Also sanitize (infer shapes) to keep IO types consistent.
             sanitize_exported_onnx_inplace(dst, rewrite_gemm=False)
 

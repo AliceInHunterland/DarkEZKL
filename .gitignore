@@ -1,0 +1,16 @@
+.DS_Store
+.idea/
+.venv/
+.cache/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+results/
+cache/
+.ezkl/
+srs_work/
+tmp/
+
+*.log

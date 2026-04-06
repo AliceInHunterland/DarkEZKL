@@ -1,295 +1,197 @@
-<h1 align="center">
-	<br>
-	Dark-EZKL
-	<br>
-	<img src="DarkEzkl.png" width="300" />
-	<br>
-</h1>
+# Dark-EZKL
 
-> A scaling-focused fork of EZKL for ZKML on large Transformer / LLM-style models.
+Dark-EZKL is a Docker-first research fork of EZKL trimmed to one reproducible benchmark flow:
 
-This repository contains **Dark-EZKL**: a research-oriented fork of the upstream **EZKL v23.0.3** project (original: `zkonduit/ezkl`). Dark-EZKL focuses on **making large-model ZK inference more practical** by introducing a **probabilistic verification execution mode** (e.g. Freivalds-style checks for expensive linear algebra) and by documenting/benchmarking scaling behavior.
+- paper benchmark: `lenet-5-small` full-circuit plus adapter-mode for `lenet-5-small`, `repvgg-a0`, and `vit`
+- exploratory `repvgg-a0` full-circuit benchmarking
+- plot generation from saved benchmark summaries
 
----
+## What Is Current
 
-## Key docs (start here)
+- Main runner: `scripts/vision_adapter_benchmark.py`
+- Plotter: `scripts/plot_vision_adapter_figures.py`
+- Paper-safe full-circuit: `lenet-5-small`
+- Paper-safe adapter-mode: `lenet-5-small repvgg-a0 vit`
+- Exploratory full-circuit: `repvgg-a0`, only when you opt in explicitly with `--full-circuit-models repvgg-a0`
+- Recommended execution mode: `exact`
 
-- **Probabilistic verification (design, knobs, security notes):** `PROBABILISTIC.md`
-- **Benchmarks (what is measured + how to interpret outputs):** `BENCHMARKS.md`
-- **Trusted SRS reconstruction / offline cache (avoid dummy k=26 OOM):** `SRS_RECONSTRUCTION.md`
+This repo no longer uses the older `benchmark.py`, `bench_vit.py`, `docker-compose.yml`, or `BENCHMARKS.md` flow.
 
----
-
-## Built-in benchmark models (defaults)
-
-The benchmark runner ships with a few built-in models (exported to ONNX by the runner):
-
-- `lenet-5-small`
-- `vit`
-- `repvgg-a0`
-
-(See `BENCHMARKS.md` for what each run measures and what artifacts are produced.)
-
----
-
-## Run the benchmarks in Docker (recommended)
-
-### Host requirements
+## Requirements
 
 - Docker
-- **NVIDIA GPU** + driver
-- NVIDIA Container Toolkit installed (so Docker can access GPUs)
+- NVIDIA GPU
+- NVIDIA Container Toolkit
 
-If you *don’t* have a GPU, you can still try running without `--gpus all`, but performance will be much slower and some configurations may not work.
+The documented path is Docker. Native host installs are possible, but they are not the maintained workflow here.
 
-### GPU server quick path
+## 1. Build The Image
 
-If you are preparing a fresh GPU server, the helper script gives you a reproducible flow:
-
-```bash
-chmod +x ./setup-gpu.sh
-./setup-gpu.sh check
-./setup-gpu.sh prepare
-./setup-gpu.sh build
-./setup-gpu.sh smoke
-```
-
-For the full suite once the smoke run succeeds:
+Run this from the repo root on the server:
 
 ```bash
-./setup-gpu.sh suite
+docker build --pull -t dark-ezkl:vision .
 ```
 
-If your server cannot fetch the trusted SRS for large circuits, pre-seed it first:
+Important:
+- Rebuild the image after pulling repo changes.
+- The current image includes `onnxconverter-common`, which is required for RepVGG split fp16 conversion.
+
+## 2. Prepare Persistent Directories
+
+```bash
+mkdir -p results cache .ezkl
+```
+
+These mounts persist across reruns:
+
+- `results/` for benchmark outputs
+- `cache/` for Torch and Hugging Face caches
+- `.ezkl/` for SRS files
+
+## 3. Optional: Pre-Seed Large SRS Files
+
+If your machine cannot download large trusted setup files during the run:
 
 ```bash
 ./scripts/reconstruct_srs_kzg26.sh
 ```
 
----
+See [SRS_RECONSTRUCTION.md](SRS_RECONSTRUCTION.md) for details.
 
-## 1) Build the Docker image
+## 4. Optional: Quick Sanity Check
 
-From the repo root:
-
-```bash
-docker build -t dark-ezkl:bench .
-```
-
-This image compiles:
-- the `ezkl` CLI (from `./ezkl`)
-- the Python wheel/bindings used by the benchmark scripts
-
-Build time can be substantial (Rust + CUDA/PyTorch base).
-
----
-
-## 2) Prepare host output/cache directories (recommended)
-
-These mounts make reruns much faster (weights + SRS + HF/Torch caches persist on the host):
-
-```bash
-mkdir -p results cache .ezkl
-```
-
-- `./results`  → benchmark outputs (JSON reports + artifacts per run)
-- `./cache`    → Torch/HuggingFace/ONNX caches
-- `./.ezkl`    → EZKL SRS cache (e.g. `./.ezkl/srs/`)
-
----
-
-## 3) Quick sanity check: GPU visible in container
+This confirms the rebuilt image sees the GPU and the RepVGG fp16 conversion dependency:
 
 ```bash
 docker run --rm --gpus all \
-  dark-ezkl:bench \
-  python3 -c "import torch; print('cuda available:', torch.cuda.is_available())"
+  dark-ezkl:vision \
+  python3 -c "import torch, onnxconverter_common; print('cuda_available=', torch.cuda.is_available())"
 ```
 
----
+## 5. Run The Paper Benchmark
 
-## 4) Run benchmarks
-
-### Quick test (recommended for first run)
+This is the main reproducible command:
 
 ```bash
 docker run --rm --gpus all --shm-size=16g \
   -v "$PWD/results:/app/results" \
   -v "$PWD/cache:/app/.cache" \
   -v "$PWD/.ezkl:/root/.ezkl" \
-  dark-ezkl:bench \
-  python3 /app/benchmark.py --outdir /app/results \
+  dark-ezkl:vision \
+  python3 /app/scripts/vision_adapter_benchmark.py \
+    --models lenet-5-small repvgg-a0 vit \
+    --full-circuit-models lenet-5-small \
+    --out-dir /app/results/vision_adapter_bench \
+    --rank 4 \
+    --alpha 8 \
+    --max-modules 8 \
+    --full-execution-mode exact \
+    --adapter-execution-mode exact
+```
+
+Expected outputs:
+
+- `results/vision_adapter_bench/vision_adapter_summary.json`
+- `results/vision_adapter_bench/model_comparison.csv`
+- `results/vision_adapter_bench/adapter_module_metrics.csv`
+- `results/vision_adapter_bench/plots/*.png`
+- `results/vision_adapter_bench/plots/*.pdf`
+
+## 6. Run A Faster Smoke Benchmark
+
+Use this before the full paper run:
+
+```bash
+docker run --rm --gpus all --shm-size=16g \
+  -v "$PWD/results:/app/results" \
+  -v "$PWD/cache:/app/.cache" \
+  -v "$PWD/.ezkl:/root/.ezkl" \
+  dark-ezkl:vision \
+  python3 /app/scripts/vision_adapter_benchmark.py \
+    --models lenet-5-small repvgg-a0 vit \
+    --full-circuit-models lenet-5-small \
+    --out-dir /app/results/vision_adapter_smoke \
+    --rank 4 \
+    --alpha 8 \
+    --max-modules 2 \
+    --full-execution-mode exact \
+    --adapter-execution-mode exact
+```
+
+## 7. Run RepVGG Full-Circuit Preflight
+
+This is the safest exact command for checking whether the RepVGG full-circuit path gets through export, sanitize, split, calibrate, setup, witness, and mock before you spend time on proving:
+
+```bash
+docker run --rm --gpus all --shm-size=16g \
+  -v "$PWD/results:/app/results" \
+  -v "$PWD/cache:/app/.cache" \
+  -v "$PWD/.ezkl:/root/.ezkl" \
+  dark-ezkl:vision \
+  python3 /app/scripts/vision_adapter_benchmark.py \
     --models repvgg-a0 \
-    --prob-k-values 2 \
-    --runs 1
+    --full-circuit-models repvgg-a0 \
+    --no-run-adapters \
+    --out-dir /app/results/repvgg_full_circuit_preflight \
+    --repeats 0 \
+    --warmup 0 \
+    --full-execution-mode exact \
+    --no-plots
 ```
 
-### Full benchmark suite (11-21 hours)
+This path is exploratory, not part of the paper-safe default.
 
-This runs the **complete** matrix of cases (3 models × 2 prob_k × 3 runs = 18 tests):
+## 8. Run RepVGG Full-Circuit Benchmark
+
+If the preflight passes, run the benchmark:
 
 ```bash
 docker run --rm --gpus all --shm-size=16g \
   -v "$PWD/results:/app/results" \
   -v "$PWD/cache:/app/.cache" \
   -v "$PWD/.ezkl:/root/.ezkl" \
-  dark-ezkl:bench \
-  python3 /app/benchmark.py --outdir /app/results
+  dark-ezkl:vision \
+  python3 /app/scripts/vision_adapter_benchmark.py \
+    --models repvgg-a0 \
+    --full-circuit-models repvgg-a0 \
+    --no-run-adapters \
+    --out-dir /app/results/repvgg_full_circuit \
+    --repeats 1 \
+    --warmup 0 \
+    --full-execution-mode exact \
+    --no-plots
 ```
 
-### Alternative: Docker Compose
+## 9. Regenerate Plots Only
 
-The compose file is now server-oriented: it persists `results`, `.cache`, and the EZKL SRS cache under `./.ezkl`.
-
-```bash
-mkdir -p results cache .ezkl
-docker compose up --build test
-```
-
-Override the suite matrix without editing YAML:
-
-```bash
-BENCHMARK_MODELS=repvgg-a0 \
-BENCHMARK_PROB_K_VALUES=2 \
-BENCHMARK_RUNS=1 \
-docker compose up --build test
-```
-
-### What you get (suite)
-- `results/benchmark.json` (suite summary: cases + aggregates + env)
-- `results/runs/<model>/k<prob_k>/run<i>/...` (per-run directories + artifacts)
-  - each run includes a `vit_bench_report.json` (name is historical; it’s used for all models)
-
----
-
-## 5) Run a single model once (bench_vit.py)
-
-Use this when iterating/debugging or when you only want LeNet / ViT / RepVGG.
-
-### LeNet (single run)
+If the benchmark already finished and you only want plots:
 
 ```bash
 docker run --rm --gpus all --shm-size=16g \
   -v "$PWD/results:/app/results" \
   -v "$PWD/cache:/app/.cache" \
   -v "$PWD/.ezkl:/root/.ezkl" \
-  dark-ezkl:bench \
-  python3 /app/bench_vit.py \
-    --outdir /app/results/single/lenet_k4 \
-    --model-name lenet-5-small \
-    --prob-k 4 \
-    --prob-ops MatMul,Gemm,Conv \
-    --prob-seed-mode fiat_shamir
+  dark-ezkl:vision \
+  python3 /app/scripts/plot_vision_adapter_figures.py \
+    --summary /app/results/vision_adapter_bench/vision_adapter_summary.json \
+    --out-dir /app/results/vision_adapter_bench/plots
 ```
 
-### ViT (single run)
+## 10. Resume Long Runs
+
+The benchmark checkpoints as it goes. If a run is interrupted, rerun the exact same command and completed work will be reused when possible.
+
+For remote servers:
 
 ```bash
-docker run --rm --gpus all --shm-size=16g \
-  -v "$PWD/results:/app/results" \
-  -v "$PWD/cache:/app/.cache" \
-  -v "$PWD/.ezkl:/root/.ezkl" \
-  dark-ezkl:bench \
-  python3 /app/bench_vit.py \
-    --outdir /app/results/single/vit_k4 \
-    --model-name vit \
-    --prob-k 4 \
-    --prob-ops MatMul,Gemm,Conv \
-    --prob-seed-mode fiat_shamir
+tmux new -s darkezkl
 ```
 
-### RepVGG (single run)
+Then paste one of the `docker run ...` commands above inside that session.
 
-```bash
-docker run --rm --gpus all --shm-size=16g \
-  -v "$PWD/results:/app/results" \
-  -v "$PWD/cache:/app/.cache" \
-  -v "$PWD/.ezkl:/root/.ezkl" \
-  dark-ezkl:bench \
-  python3 /app/bench_vit.py \
-    --outdir /app/results/single/repvgg_k4 \
-    --model-name repvgg-a0 \
-    --prob-k 4 \
-    --prob-ops MatMul,Gemm,Conv \
-    --prob-seed-mode fiat_shamir
-```
+## Docs
 
-### What you get (single run)
-
-Under the `--outdir` you pass (e.g. `results/single/vit_k4/`):
-
-- `vit_bench_report.json` (the measured timings + logrows + paths to artifacts)
-- various EZKL artifacts (settings, compiled circuit, keys, witness, proof, etc.)
-
-See `BENCHMARKS.md` for the meaning of each timing key.
-
----
-
-## Notes / troubleshooting
-
-### 1) First run downloads weights/datasets
-Depending on the model, first run may download:
-- torchvision weights (ViT)
-- timm weights (RepVGG)
-- datasets (LeNet training or data generation, depending on runner behavior)
-
-Mounting `./cache:/app/.cache` avoids redownloading.
-
-Important:
-- If you run with `HF_HUB_OFFLINE=1` and the required pretrained weights are not already cached,
-  some loaders may fall back to `pretrained=False`.
-- That is acceptable for pipeline smoke tests, but it is not representative if you intend to
-  benchmark the pretrained model itself. Warm the cache once online first, then rerun offline.
-
-### 2) SRS downloads / materialization can be large (and can look "stuck")
-`ezkl get-srs` needs an SRS for the chosen `logrows` (`k`).
-
-Tips:
-- **Persist the cache**: mount `./.ezkl:/root/.ezkl` to avoid re-downloading / re-generating across runs.
-- **No-network (benchmarking only, small k):** run with `-e EZKL_SRS_SOURCE=dummy` (**recommended only for `k <= 22`**).
-  - For `k=26`, dummy generation is huge and often gets OOM-killed; instead **pre-seed a trusted SRS**
-    at `./.ezkl/srs/kzg26.srs` (see `SRS_RECONSTRUCTION.md`, or run `./scripts/reconstruct_srs_kzg26.sh`).
-- If your **run directory is on a different filesystem** (common with Docker bind mounts), copying a multi‑GB SRS
-  can take a long time. Dark‑EZKL now tries **`hardlink → symlink → copy`** when writing to `--srs-path`.
-  - You can force this with `EZKL_SRS_MATERIALIZE=symlink` (or `auto|hardlink|copy`).
-
-### 3) ViT is heavy
-`vit` can require higher `logrows` and significant RAM/VRAM.
-If it fails, start with:
-- fewer/lower `--prob-k`
-- running a smaller model first (LeNet)
-- increasing host resources
-
-### 4) Where to look when something fails
-Start with the per-run JSON report:
-- `results/.../vit_bench_report.json`
-
-It contains paths to the exact artifacts used for that run (settings, compiled circuit, witness, proof).
-
-### 5) MNIST “HTTP Error 404” during download is expected
-Torchvision’s MNIST downloader tries an old mirror first, then automatically falls back to an alternate mirror.
-If the download eventually succeeds and extraction proceeds, you can ignore the earlier 404 lines.
-
-### 6) PyTorch `TracerWarning` during export is expected
-Warnings like:
-- `TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect...`
-
-usually occur during tracing / ONNX export. They are non-fatal for this benchmark flow.
-
-### 7) “Is it stuck?” checklist
-If you’re unsure whether the benchmark is still making progress:
-
-- Check the container is still alive:
-  - `docker ps`
-- Check GPU/CPU activity:
-  - `nvidia-smi -l 1`
-  - `top` / `htop`
-- Check the host-mounted output directory is changing:
-  - new per-run folders under `results/runs/...`
-  - a `vit_bench_report.json` appears when a run finishes
-- Check the host-mounted `.ezkl/` is growing (SRS download / cache), especially on the first run.
-
-If everything is idle for a long time (e.g. 10–15+ minutes) and there are no new files being written,
-rerun a *single* small case first (`bench_vit.py --model-name lenet-5-small`) to validate the pipeline end-to-end.
-
----
+- [PROBABILISTIC.md](PROBABILISTIC.md) for probabilistic execution design and security notes
+- [SRS_RECONSTRUCTION.md](SRS_RECONSTRUCTION.md) for offline trusted setup reconstruction
+- [ezkl/README.md](ezkl/README.md) for the embedded proving engine note
